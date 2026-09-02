@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // host telegram.sendPoll：群投票（真人感「事件型」动作）的闸测试。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 const GROUP = -1002450361141;
 
 const sendPollMock = vi.fn(async () => 4242);

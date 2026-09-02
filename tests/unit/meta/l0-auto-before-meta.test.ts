@@ -41,7 +41,7 @@ vi.mock('../../../src/bot/bot.js', () => ({
 }));
 vi.mock('../../../src/env.js', () => ({
   env: () => ({
-    MASTER_UID: 6251541967,
+    MASTER_UID: 905966090,
     META_USAGE: 'judge',
     CODEACT_TIMEOUT_MS: 5000,
     CODEACT_BANNED_WORDS: [],
@@ -83,7 +83,7 @@ describe('L0 autoDispatch before Meta LLM', () => {
         pressure: 100,
         reason: 'mention',
         messageId: 393495,
-        userId: 6251541967,
+        userId: 905966090,
         textPreview: '千雪怎么了',
         createdAt: Date.now(),
         payload: {
@@ -109,7 +109,7 @@ describe('L0 autoDispatch before Meta LLM', () => {
       targetUserId?: number;
     };
     expect(task.quoteMessageIds).toEqual([393495]);
-    expect(task.targetUserId).toBe(6251541967);
+    expect(task.targetUserId).toBe(905966090);
     expect(task.contentDirection).toMatch(/回复你的 #393494/);
     expect(task.contentDirection).toMatch(/千雪怎么了/);
     expect(task.contentDirection).toMatch(/禁止臆造/);

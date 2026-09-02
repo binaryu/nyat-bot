@@ -105,7 +105,7 @@ tail -c 3000 /root/xxb-ts/logs/app.log | strings | grep -E 'error|Error|WARN'
 SILENCE_ALERT_ENABLED=true
 SILENCE_ALERT_THRESHOLD_SEC=900
 SILENCE_ALERT_COOLDOWN_SEC=3600
-SILENCE_ALERT_OWNER_UID=6251541967
+SILENCE_ALERT_OWNER_UID=905966090
 ```
 
 **last_bot_reply 更新点：** 在 `src/bot/sender/telegram.ts` 的 `sendMessage` 成功后写 Redis timestamp。

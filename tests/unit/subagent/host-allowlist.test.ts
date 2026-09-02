@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // host 层 allowlist 命名空间测试：闸（flag / DM-only / master-only）+ 到 bot-flow 的接线。
 // bot-flow 模块整体 mock 掉——流程逻辑在 tests/unit/allowlist/bot-flow.test.ts 覆盖。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 const OTHER_USER = 12345;
 const GROUP = -1002450361141;
 

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // host telegram.forward：白名单群对群转发的隐私闸测试。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 const GROUP_A = -1002450361141;
 const GROUP_B = -1003184176508;
 

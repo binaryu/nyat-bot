@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 const GROUP = -1002450361141;
 
 const sendMessage = vi.fn();

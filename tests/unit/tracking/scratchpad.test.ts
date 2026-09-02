@@ -14,7 +14,7 @@ const { setScratch, clearScratch, getScratch, getScratchSync, scratchPromptBlock
   '../../../src/tracking/scratchpad.js'
 );
 
-const CHAT = 6251541967;
+const CHAT = 905966090;
 
 beforeEach(() => {
   redisStore.clear();

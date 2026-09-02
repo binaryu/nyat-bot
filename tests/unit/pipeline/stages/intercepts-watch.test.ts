@@ -28,7 +28,7 @@ const { dispatchCommand } = await import('../../../../src/pipeline/stages/interc
 const { createGoal, listGoals } = await import('../../../../src/agent/goals.js');
 
 const formatted = {
-  uid: 6251541967,
+  uid: 905966090,
   messageId: 100,
   textContent: '追踪比特币',
 } as never;
@@ -42,14 +42,14 @@ beforeEach(() => {
 
 describe('dispatchCommand /watch 分流', () => {
   it('DM(chatId>0)→ createGoal 落 goals 表(origin=master)', async () => {
-    const handled = await dispatchCommand(6251541967, formatted, '/watch', '比特币');
+    const handled = await dispatchCommand(905966090, formatted, '/watch', '比特币');
     expect(handled).toBe(true);
 
     const goals = listGoals('active');
     expect(goals).toHaveLength(1);
     expect(goals[0]!.topic).toBe('比特币');
     expect(goals[0]!.origin).toBe('master');
-    expect(goals[0]!.chat_id).toBe(6251541967);
+    expect(goals[0]!.chat_id).toBe(905966090);
 
     expect(sendDirectMock).toHaveBeenCalledOnce();
     expect(String(sendDirectMock.mock.calls[0]![1])).toContain('比特币');
@@ -63,16 +63,16 @@ describe('dispatchCommand /watch 分流', () => {
   });
 
   it('重复 topic 不重复建 goal(createGoal 去重)', async () => {
-    await dispatchCommand(6251541967, formatted, '/watch', '比特币');
-    await dispatchCommand(6251541967, formatted, '/watch', '比特币');
+    await dispatchCommand(905966090, formatted, '/watch', '比特币');
+    await dispatchCommand(905966090, formatted, '/watch', '比特币');
     expect(listGoals('active')).toHaveLength(1);
   });
 
   it('超过 GOAL_MAX_ACTIVE 时拒绝并提示', async () => {
     for (let i = 0; i < 5; i++) {
-      await dispatchCommand(6251541967, formatted, '/watch', `话题 ${i}`);
+      await dispatchCommand(905966090, formatted, '/watch', `话题 ${i}`);
     }
-    await dispatchCommand(6251541967, formatted, '/watch', '第六个');
+    await dispatchCommand(905966090, formatted, '/watch', '第六个');
     expect(listGoals('active')).toHaveLength(5);
     expect(String(sendDirectMock.mock.calls.at(-1)![1])).toContain('没立上');
   });

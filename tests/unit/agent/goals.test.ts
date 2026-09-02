@@ -40,7 +40,7 @@ beforeEach(() => {
 
 describe('createGoal', () => {
   it('creates and rejects duplicates', () => {
-    const id = createGoal({ topic: '主人的 Sub2API 项目进展', origin: 'master', chatId: 6251541967 });
+    const id = createGoal({ topic: '主人的 Sub2API 项目进展', origin: 'master', chatId: 905966090 });
     expect(id).toBeGreaterThan(0);
     expect(createGoal({ topic: '主人的 Sub2API 项目进展', origin: 'self' })).toBeNull();
   });

@@ -5,7 +5,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../../../src/env.js', () => ({
   env: () => ({
-    MASTER_UID: 6251541967,
+    MASTER_UID: 905966090,
     MASTER_UID_EXTRA: [] as number[],
     SLEEP_DM_ENABLED: true,
     DM_PROACTIVE_COOLDOWN_HOURS: 20,
@@ -36,7 +36,7 @@ vi.mock('../../../src/tracking/user-affinity.js', () => ({
 }));
 vi.mock('../../../src/tracking/user-profile.js', () => ({
   // 主人的 sender_tag 被学成了「妹妹」(真实数据),验证主人关系压过外号。
-  getAggregatedUserTag: vi.fn((uid: number) => (uid === 6251541967 ? '妹妹' : '阿强')),
+  getAggregatedUserTag: vi.fn((uid: number) => (uid === 905966090 ? '妹妹' : '阿强')),
   // uid=222 设了 bot_tag「猫哥」(私聊"叫我猫哥"纠正过),验证 bot_tag 优先于群里外号。
   getBotTagForAddressing: vi.fn((chatId: number, uid: number) => (uid === 222 ? '猫哥' : null)),
 }));
@@ -45,7 +45,7 @@ import { nicknameHint, fallbackGreeting } from '../../../src/pipeline/dm-proacti
 
 describe('DM 问候称呼:主人关系优先于学来的外号', () => {
   it('nicknameHint:主人 → 「主人」,不被学来的「妹妹」盖过', () => {
-    const hint = nicknameHint(6251541967);
+    const hint = nicknameHint(905966090);
     expect(hint).toContain('主人');
     expect(hint).not.toContain('妹妹');
   });
@@ -60,7 +60,7 @@ describe('DM 问候称呼:主人关系优先于学来的外号', () => {
   });
 
   it('fallbackGreeting:主人 → 前缀「主人」', () => {
-    const out = fallbackGreeting('morning', 6251541967);
+    const out = fallbackGreeting('morning', 905966090);
     expect(out.startsWith('主人,')).toBe(true);
     expect(out).not.toContain('妹妹');
   });

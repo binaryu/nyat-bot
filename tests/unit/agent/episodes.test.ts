@@ -28,7 +28,7 @@ describe('episodes store', () => {
   it('saveEpisode roundtrips and returns rowid', () => {
     const id = saveEpisode({
       taskId: 't1',
-      chatId: 6251541967,
+      chatId: 905966090,
       goal: '写个贪吃蛇 HTML',
       outcome: 'done',
       summary: '写了 snake.html 并 sendFile 交付',

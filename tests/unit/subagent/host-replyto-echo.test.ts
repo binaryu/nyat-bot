@@ -110,16 +110,16 @@ describe('host sendText replyTo + self-echo', () => {
   });
 
   it('DM does not force replyTo when model omits', async () => {
-    const host = createHostApi(6251541967, {
+    const host = createHostApi(905966090, {
       defaultReplyTo: 99,
       onEnd: () => {},
     });
     await host.telegram.sendText('哼，才不告诉你');
-    expect(sendMessage).toHaveBeenCalledWith(6251541967, '哼，才不告诉你', undefined, undefined);
+    expect(sendMessage).toHaveBeenCalledWith(905966090, '哼，才不告诉你', undefined, undefined);
   });
 
   it('DM rejects foreign replyTo ≠ task quote (no group→DM 串台)', async () => {
-    const host = createHostApi(6251541967, {
+    const host = createHostApi(905966090, {
       defaultReplyTo: 2862,
       onEnd: () => {},
     });
@@ -138,7 +138,7 @@ describe('host sendText replyTo + self-echo', () => {
     expect(sendMessage).toHaveBeenCalled();
     sendMessage.mockClear();
 
-    const dm = createHostApi(6251541967, {
+    const dm = createHostApi(905966090, {
       defaultReplyTo: 2862,
       onEnd: () => {},
     });

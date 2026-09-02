@@ -13,7 +13,7 @@ vi.mock('../../../../src/shared/logger.js', () => ({
 }));
 vi.mock('../../../../src/db/redis.js', () => ({ getRedis: () => ({}) }));
 vi.mock('../../../../src/env.js', () => ({
-  env: () => ({ ALLOWLIST_REVIEW_ON_JOIN: true, MASTER_UID: 6251541967 }),
+  env: () => ({ ALLOWLIST_REVIEW_ON_JOIN: true, MASTER_UID: 905966090 }),
 }));
 vi.mock('../../../../src/allowlist/allowlist.js', () => ({
   setGroupEnabled: (...a: unknown[]) => setGroupEnabledMock(...a),
@@ -49,7 +49,7 @@ function makeCtx(oldStatus: string, newStatus: string) {
       chat: { id: -1004384664699, type: 'supergroup' },
       old_chat_member: { status: oldStatus },
       new_chat_member: { status: newStatus },
-      from: { id: 6251541967 },
+      from: { id: 905966090 },
     },
   };
 }

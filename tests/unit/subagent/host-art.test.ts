@@ -36,7 +36,7 @@ vi.mock('../../../src/meta/answered.js', () => ({
 }));
 
 const envBase: Record<string, unknown> = {
-  MASTER_UID: 6251541967,
+  MASTER_UID: 905966090,
   CODEACT_BANNED_WORDS: [],
   POST_TASK_WINDOW_ENABLED: false,
   MEMORY_CROSS_CONTEXT_ENABLED: false,

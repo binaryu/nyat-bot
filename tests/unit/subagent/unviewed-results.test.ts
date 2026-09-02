@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // 只看到 'ok' → 向主人报「工具只回 ok，办不到」。机制修复：host 给查询类工具
 // 结果留摘要，executor 在模型没 return 时捡回附进 output。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 
 const executeSearch = vi.fn(async () => 'DeepSeek API 新定价 8/16 UTC 生效，峰谷价差翻倍，V4 系列普涨……（共1247字）');
 const callWithFallback = vi.fn(async () => ({ content: '{"promise": false, "topic": ""}' }));
