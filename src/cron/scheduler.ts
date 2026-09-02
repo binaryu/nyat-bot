@@ -36,10 +36,12 @@ export function startCronJobs(deps?: CronDeps): void {
     return;
   }
 
-  // Model status check — every 5 minutes
-  tasks.push(schedule('*/5 * * * *', () => {
-    void safeRun('model-check', runModelCheck);
-  }));
+  // Model status check — configurable cadence, default every 5 minutes
+  if (env().MODEL_CHECK_ENABLED) {
+    tasks.push(schedule(env().MODEL_CHECK_CRON, () => {
+      void safeRun('model-check', runModelCheck);
+    }));
+  }
 
   // Daily report — every day at 23:55 Beijing time (15:55 UTC)
   tasks.push(schedule('55 15 * * *', () => {

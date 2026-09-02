@@ -27,6 +27,8 @@ const envSchema = z.object({
 
   // Cron master switch — read via env() like every other flag (kilo review).
   CRON_ENABLED: booleanFromEnv.default(true),
+  MODEL_CHECK_ENABLED: booleanFromEnv.default(true),
+  MODEL_CHECK_CRON: z.string().default('*/5 * * * *'),
 
   // NyatDB — NyatBot-only embedded engine (MemTable+WAL+zstd). Default off.
   NYATDB_ENABLED: booleanFromEnv.default(false),

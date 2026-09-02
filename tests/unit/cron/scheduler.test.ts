@@ -54,6 +54,8 @@ const envOverrides: Record<string, unknown> = { CRON_ENABLED: true };
 vi.mock('../../../src/env.js', () => ({
   env: () => ({
     CRON_ENABLED: envOverrides['CRON_ENABLED'] ?? true,
+    MODEL_CHECK_ENABLED: envOverrides['MODEL_CHECK_ENABLED'] ?? true,
+    MODEL_CHECK_CRON: (envOverrides['MODEL_CHECK_CRON'] as string) ?? '*/5 * * * *',
     PROACTIVE_SCAN_ENABLED: false,
     VERIFY_ENABLED: false,
     LEARNER_ENABLED: false,
