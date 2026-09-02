@@ -55,7 +55,7 @@ export function sanitizeForGrounding(text: string): string {
   // @mention（TG username 是 [A-Za-z0-9_]，中文圈也常见 @中文昵称）
   t = t.replace(/@[\w\u4e00-\u9fff]+/g, '');
 
-  // uid 显式痕迹：uid:6251541967 / uid=123 / UID 123
+  // uid 显式痕迹：uid:905966090 / uid=123 / UID 123
   t = t.replace(/\buid\s*[:=]?\s*\d{4,12}\b/gi, '某人');
 
   // 时间戳：[2024-01-01 12:00(:ss)] / [12:00(:ss)]

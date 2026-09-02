@@ -38,7 +38,7 @@ beforeEach(async () => {
 });
 
 function fakeJob(taskId: number) {
-  return { data: { type: 'task_execute', taskId, chatId: 6251541967, ownerUid: 6251541967 } } as never;
+  return { data: { type: 'task_execute', taskId, chatId: 905966090, ownerUid: 905966090 } } as never;
 }
 
 describe('task-worker synthesis', () => {
@@ -47,12 +47,12 @@ describe('task-worker synthesis', () => {
     (executeSearch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue('东京天气下雨,26度。');
     callMock.mockResolvedValue({ content: '东京今日有雨,22-28度,出门带伞。' });
 
-    const id = createTask({ ownerUid: 6251541967, chatId: 6251541967, goal: '东京今日天气' });
+    const id = createTask({ ownerUid: 905966090, chatId: 905966090, goal: '东京今日天气' });
     const out = await executeTask(fakeJob(id));
 
     expect(callMock).toHaveBeenCalledTimes(1);
     expect((callMock.mock.calls[0]![0] as { usage: string }).usage).toBe('summarize');
-    expect(sendMock).toHaveBeenCalledWith(6251541967, expect.stringContaining('东京今日有雨'));
+    expect(sendMock).toHaveBeenCalledWith(905966090, expect.stringContaining('东京今日有雨'));
     expect(out).toBe('东京今日有雨,22-28度,出门带伞。');
   });
 
@@ -61,10 +61,10 @@ describe('task-worker synthesis', () => {
     (executeSearch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue('第一轮搜索内容,足够长的一些信息内容。');
     callMock.mockRejectedValue(new Error('provider down'));
 
-    const id = createTask({ ownerUid: 6251541967, chatId: 6251541967, goal: '测试目标' });
+    const id = createTask({ ownerUid: 905966090, chatId: 905966090, goal: '测试目标' });
     const out = await executeTask(fakeJob(id));
 
-    expect(sendMock).toHaveBeenCalledWith(6251541967, expect.stringContaining('第一轮搜索内容'));
+    expect(sendMock).toHaveBeenCalledWith(905966090, expect.stringContaining('第一轮搜索内容'));
     expect(out).toContain('第一轮搜索内容');
   });
 
@@ -73,7 +73,7 @@ describe('task-worker synthesis', () => {
     (executeSearch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue('第二轮的搜索内容,也足够长可以发送给用户看。');
     callMock.mockResolvedValue({ content: ' ' });
 
-    const id = createTask({ ownerUid: 6251541967, chatId: 6251541967, goal: '另一个目标' });
+    const id = createTask({ ownerUid: 905966090, chatId: 905966090, goal: '另一个目标' });
     const out = await executeTask(fakeJob(id));
 
     expect(out).toContain('第二轮的搜索内容');

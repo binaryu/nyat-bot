@@ -1,7 +1,7 @@
 import 'dotenv/config';
 const { getRecent } = await import('/root/xxb-ts/src/pipeline/context/manager.js');
 const cutoff = Date.now() / 1000 - 48 * 3600;
-const chats = [-1002450361141, -1003184176508, -1003579270814, -1003778222462, -1003022727627, 6251541967];
+const chats = [-1002450361141, -1003184176508, -1003579270814, -1003778222462, -1003022727627, 905966090];
 const out: string[] = [];
 for (const c of chats) {
   try {

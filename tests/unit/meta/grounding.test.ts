@@ -77,10 +77,10 @@ describe('looksFactualQuestion heuristic', () => {
 
 describe('sanitizeForGrounding', () => {
   it('strips @mentions and uid traces, keeps factual core', () => {
-    const out = sanitizeForGrounding('@Zh_Taiwan 听说 uid:6251541967 说的那个什么新政策是真的吗');
+    const out = sanitizeForGrounding('@Zh_Taiwan 听说 uid:905966090 说的那个什么新政策是真的吗');
     expect(out).not.toContain('@');
     expect(out).not.toContain('Zh_Taiwan');
-    expect(out).not.toContain('6251541967');
+    expect(out).not.toContain('905966090');
     expect(out).not.toMatch(/uid/i);
     expect(out).toContain('什么新政策是真的吗');
   });

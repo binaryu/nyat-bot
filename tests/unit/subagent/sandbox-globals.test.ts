@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const envBase = {
   CODEACT_TIMEOUT_MS: 5000,
-  MASTER_UID: 6251541967,
+  MASTER_UID: 905966090,
 };
 vi.mock('../../../src/env.js', () => ({ env: () => envBase }));
 vi.mock('../../../src/shared/logger.js', () => ({

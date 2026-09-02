@@ -39,10 +39,10 @@ describe('speaker-burst', () => {
   });
 
   it('markSpeakerBurst stores uid with coalesce-based TTL', async () => {
-    await markSpeakerBurst(-1001, 6251541967);
+    await markSpeakerBurst(-1001, 905966090);
     expect(redisSet).toHaveBeenCalledWith(
       'xxb:meta:speaker_burst:-1001',
-      '6251541967',
+      '905966090',
       'EX',
       8,
     );

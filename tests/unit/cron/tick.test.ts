@@ -49,7 +49,7 @@ vi.mock('../../../src/env.js', () => ({
     UNIFIED_TICK_USAGE: 'judge',
     UNIFIED_TICK_HOUR_START: 0,
     UNIFIED_TICK_HOUR_END: 23,
-    MASTER_UID: 6251541967,
+    MASTER_UID: 905966090,
     GOAL_TRACKER_ENABLED: false,
     RSS_MONITOR_ENABLED: false,
     SELF_PLAY_COOLDOWN_SEC: 14400,
@@ -117,7 +117,7 @@ describe('runUnifiedTick execution mapping', () => {
     ]);
     callWithFallbackMock.mockResolvedValue({ content: '{"action":"care_master","text":"主人忙完没~","reason":"x"}' });
     await runUnifiedTick();
-    expect(sendMessageMock).toHaveBeenCalledWith(6251541967, '主人忙完没~');
+    expect(sendMessageMock).toHaveBeenCalledWith(905966090, '主人忙完没~');
     expect(acquireSlotMock).toHaveBeenCalled();
   });
 
@@ -136,7 +136,7 @@ describe('runUnifiedTick execution mapping', () => {
     getRecentMock.mockResolvedValue([
       { role: 'user', uid: 1, fullName: '主人', username: 'm', textContent: '很久以前', timestamp: now - 10 * 3600, messageId: 1 },
     ]);
-    redisStore.set('xxb:proactive:last_care:6251541967', String(now - 600));
+    redisStore.set('xxb:proactive:last_care:905966090', String(now - 600));
     callWithFallbackMock.mockResolvedValue({
       content: '{"action":"care_master","text":"主人～要不要再画一个？","reason":"x"}',
     });

@@ -20,7 +20,7 @@ vi.mock('../../../src/shared/config.js', () => ({
   loadCachedPrompt: () => 'self-reflect system prompt',
 }));
 vi.mock('../../../src/env.js', () => ({
-  env: () => ({ SELF_REFLECT_ENABLED: true, SELF_REFLECT_USAGE: 'judge', MASTER_UID: 6251541967 }),
+  env: () => ({ SELF_REFLECT_ENABLED: true, SELF_REFLECT_USAGE: 'judge', MASTER_UID: 905966090 }),
 }));
 
 const { parseSelfReflectOutput, runSelfReflect } = await import('../../../src/cron/self-reflect.js');
@@ -36,9 +36,9 @@ beforeEach(() => {
   `);
   callWithFallbackMock.mockReset();
   getRecentMock.mockReset().mockResolvedValue([
-    { role: 'user', uid: 6251541967, textContent: '帮我看下这个报错', timestamp: 1, messageId: 1 },
+    { role: 'user', uid: 905966090, textContent: '帮我看下这个报错', timestamp: 1, messageId: 1 },
     { role: 'assistant', uid: 0, textContent: '好嘞主人～让本喵看看喵～', timestamp: 2, messageId: 2 },
-    { role: 'user', uid: 6251541967, textContent: '...直接说原因', timestamp: 3, messageId: 3 },
+    { role: 'user', uid: 905966090, textContent: '...直接说原因', timestamp: 3, messageId: 3 },
   ]);
   zrangeMock.mockReset().mockResolvedValue(['-1001234567890']);
 });

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // runtime.setPlan（auto+plan 模式）：任务内计划状态 + dirty 标记语义。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 
 const envBase: Record<string, unknown> = {
   MASTER_UID: MASTER,

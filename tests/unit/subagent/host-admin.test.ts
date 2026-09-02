@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // host admin 命名空间：权限自检（admin 权限不一定给到）+ 底线闸测试。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 const GROUP = -1002450361141;
 
 const getChatMemberMock = vi.fn(async () => ({

@@ -470,7 +470,7 @@ impl Engine {
         loop {
             let cf = self.pool.get(&mut self.heap, chain_page_id)?;
             for t in cf.page.all_tuples() {
-                if let Some((existing, _, _)) = decode_hot(&t) {
+                if let Ok((existing, _, _)) = decode_hot(&t) {
                     if existing != key {
                         kept.push(t);
                     }

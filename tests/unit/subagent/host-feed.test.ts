@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // host web.feed：本地 RSS 谈资库读取（找分享过的新闻的出处先翻本地）。
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 
 const redisKeys = vi.fn(async () => ['xxb:rss:fuel:-1002450361141']);
 const redisLrange = vi.fn(async () => [

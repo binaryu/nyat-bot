@@ -29,7 +29,7 @@ vi.mock('../../../src/bot/sender/telegram.js', () => ({
 import { sendMessage as senderSendMessage } from '../../../src/bot/sender/telegram.js';
 const senderMock = vi.mocked(senderSendMessage);
 
-const MASTER = 6251541967;
+const MASTER = 905966090;
 const BOT_UID = 999;
 const GROUP = -1001234567890;
 const APPLICANT = 12345;

@@ -308,7 +308,7 @@ if [ -z "$CUR_MASTER" ] || [ "$CUR_MASTER" = "0" ] || [ "$RECONFIG" = 1 ]; then
       set_env MASTER_UID "$MUID"; ok "主人 UID: $MUID"; break
     fi
     warn "请输入纯数字 ID"
-    [ "$_try" = 3 ] && die_fix "主人 UID 无效" "必须是纯数字（如 6251541967）"
+    [ "$_try" = 3 ] && die_fix "主人 UID 无效" "必须是纯数字（如 905966090）"
   done
 else
   ok "主人 UID: $CUR_MASTER"

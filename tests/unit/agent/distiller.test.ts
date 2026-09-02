@@ -26,7 +26,7 @@ const { parseDistillOutput, distillEpisode } = await import('../../../src/agent/
 
 const baseTask = {
   id: 'task-1',
-  chatId: 6251541967,
+  chatId: 905966090,
   contentDirection: '写个贪吃蛇 HTML 给主人',
   createdAt: Date.now(),
   status: 'done' as const,
@@ -117,7 +117,7 @@ describe('distillEpisode', () => {
 
     const ep = db.prepare('SELECT * FROM episodes WHERE task_id = ?').get('task-1') as Record<string, unknown>;
     expect(ep['outcome']).toBe('done');
-    expect(ep['chat_id']).toBe(6251541967);
+    expect(ep['chat_id']).toBe(905966090);
     expect(ep['turns']).toBe(8);
 
     const entries = db.prepare('SELECT * FROM experience_entries').all() as Record<string, unknown>[];

@@ -52,8 +52,8 @@ describe('saveGroupNorms / getGroupNorms', () => {
     expect(n.norms).toEqual(['玩梗多', '短句']);
     expect(n.sampleCount).toBe(30);
     // DM 不建
-    saveGroupNorms(6251541967, ['私聊风格'], 5);
-    expect(getGroupNorms(6251541967)).toBeNull();
+    saveGroupNorms(905966090, ['私聊风格'], 5);
+    expect(getGroupNorms(905966090)).toBeNull();
   });
 
   it('needsRefresh true when missing or stale', () => {
@@ -65,7 +65,7 @@ describe('saveGroupNorms / getGroupNorms', () => {
 
 describe('inferGroupNorms', () => {
   it('skips DM and too-few messages', async () => {
-    expect(await inferGroupNorms({ chatId: 6251541967, recentMessages: ['a', 'b'] })).toBeNull();
+    expect(await inferGroupNorms({ chatId: 905966090, recentMessages: ['a', 'b'] })).toBeNull();
     expect(await inferGroupNorms({ chatId: -100, recentMessages: ['a', 'b', 'c'] })).toBeNull();
   });
 
