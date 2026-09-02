@@ -3,9 +3,19 @@
 // ────────────────────────────────────────
 
 import { env } from '../env.js';
+import { isMaster } from '../admin/auth.js';
 
 const MASTER_USERNAME = 'Zh_Taiwan';
 const MASTER_DISPLAY = 'zhong yang';
+
+/** 检查用户是否有权限与 Bot 进行私聊（DM） */
+export function isDmAllowed(userId: number): boolean {
+  const e = env();
+  if (!e.DM_ALLOWLIST_ENABLED) return true;
+  if (isMaster(userId, e.MASTER_UID)) return true;
+  const allowlist = new Set(e.DM_ALLOWLIST_UIDS);
+  return allowlist.has(userId);
+}
 
 /** 注入 prompt 的主人认人块（不截断；uid 来自 env） */
 export function buildMasterIdentityBlock(): string {

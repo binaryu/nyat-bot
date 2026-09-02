@@ -117,6 +117,16 @@ const envSchema = z.object({
       if (!t) return [] as number[];
       return t.split(',').map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n) && n > 0);
     }),
+  // DM 私聊白名单控制：开启后仅白名单内用户（MASTER_UID、MASTER_UID_EXTRA 及 DM_ALLOWLIST_UIDS）可私聊
+  DM_ALLOWLIST_ENABLED: booleanFromEnv.default(false),
+  DM_ALLOWLIST_UIDS: z
+    .string()
+    .default('')
+    .transform((s) => {
+      const t = s.trim();
+      if (!t) return [] as number[];
+      return t.split(',').map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n) && n > 0);
+    }),
   BOT_NICKNAMES: z
     .string()
     .default('xxb,啾咪囝,啾咪')

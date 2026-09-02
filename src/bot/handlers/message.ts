@@ -1,6 +1,7 @@
 import type { Bot, Context } from 'grammy';
 import { logger } from '../../shared/logger.js';
 import { isDM } from '../../shared/chat.js';
+import { isDmAllowed } from '../../shared/master-identity.js';
 import { isDuplicate } from '../middleware/dedup.js';
 import { isRateLimited } from '../middleware/rate-limit.js';
 import { enqueue } from '../../queue/producer.js';
@@ -41,6 +42,13 @@ async function handleUpdate(ctx: Context): Promise<void> {
   const messageId = msg.message_id;
   const userId = msg.from?.id;
   const isEdit = !!(ctx.editedMessage ?? ctx.editedChannelPost);
+
+  if (isDM(chatId)) {
+    if (!userId || !isDmAllowed(userId)) {
+      logger.debug({ chatId, userId }, 'DM dropped: user not in DM allowlist');
+      return;
+    }
+  }
 
   try {
     if (await isDuplicate(chatId, messageId, isEdit, msg.edit_date)) return;
