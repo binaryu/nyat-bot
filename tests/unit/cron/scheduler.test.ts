@@ -41,6 +41,7 @@ vi.mock('../../../src/env.js', () => ({
   env: () => ({
     CRON_ENABLED: envOverrides['CRON_ENABLED'] ?? true,
     MODEL_CHECK_ENABLED: envOverrides['MODEL_CHECK_ENABLED'] ?? true,
+    MODEL_CHECK_CRON: (envOverrides['MODEL_CHECK_CRON'] as string) ?? '*/5 * * * *',
     VERIFY_ENABLED: false,
     LEARNER_ENABLED: false,
     SLEEP_SCHEDULE_ENABLED: false,
@@ -133,6 +134,14 @@ describe('CronScheduler(tick 心跳版)', () => {
     expect(byName.get('user-profile-sync')?.everySec).toBe(3600);
     // unified-tick — 5 分钟间隔,只是注册表里的普通任务
     expect(byName.get('unified-tick')?.everySec).toBe(5 * 60);
+  });
+
+  it('should parse MODEL_CHECK_CRON hourly interval into seconds', () => {
+    envOverrides['MODEL_CHECK_CRON'] = '0 */2 * * *';
+    startCronJobs();
+    const byName = new Map(getTickRegistry().map((t) => [t.name, t]));
+    expect(byName.get('model-check')?.everySec).toBe(2 * 3600);
+    envOverrides['MODEL_CHECK_CRON'] = '*/5 * * * *';
   });
 
   it('should not start jobs when CRON_ENABLED is false', () => {

@@ -29,6 +29,22 @@ export interface CronDeps {
 let _started = false;
 let _deps: CronDeps = {};
 
+function parseCronIntervalSec(cronStr: string, defaultSec: number): number {
+  if (!cronStr) return defaultSec;
+  const trimmed = cronStr.trim();
+  const matchHours = trimmed.match(/^(?:0|\*)\s+\*\/(\d+)\s+\*\s+\*\s+\*/);
+  if (matchHours?.[1]) {
+    const hours = Number(matchHours[1]);
+    if (!Number.isNaN(hours) && hours > 0) return hours * 3600;
+  }
+  const matchMin = trimmed.match(/^\*\/(\d+)\s+\*\s+\*\s+\*\s+\*/);
+  if (matchMin?.[1]) {
+    const mins = Number(matchMin[1]);
+    if (!Number.isNaN(mins) && mins > 0) return mins * 60;
+  }
+  return defaultSec;
+}
+
 export function startCronJobs(deps?: CronDeps): void {
   if (_started) return;
   _started = true;
@@ -41,9 +57,10 @@ export function startCronJobs(deps?: CronDeps): void {
 
   const reg = registerTickTask;
 
-  // Model status check — configurable switch, default every 5 minutes
+  // Model status check — configurable switch, default every 5 minutes (or parse from MODEL_CHECK_CRON)
   if (env().MODEL_CHECK_ENABLED) {
-    reg({ name: 'model-check', everySec: 5 * 60, run: runModelCheck });
+    const sec = parseCronIntervalSec(env().MODEL_CHECK_CRON, 5 * 60);
+    reg({ name: 'model-check', everySec: sec, run: runModelCheck });
   }
 
   // Daily report — every day at 23:55 Beijing time
