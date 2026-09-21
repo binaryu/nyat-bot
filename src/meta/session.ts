@@ -7,6 +7,7 @@ import { logger } from '../shared/logger.js';
 import { formatBeijingNowLine } from '../shared/beijing-time.js';
 import { buildMasterIdentityBlock, masterShortHint } from '../shared/master-identity.js';
 import { getGlobalState } from './global-state.js';
+import { resolveJournalChatLink, getJournalChannelInfo } from '../cron/dream-journal.js';
 import { buildMetaApiContext } from './meta-api.js';
 import type { AttentionItem, AttentionLayer, SubagentCallback } from './types.js';
 import { isMetaSubagentChat } from './flags.js';
@@ -46,7 +47,7 @@ const META_SYSTEM = `你是啾咪囝的 Meta Agent（全局编排大脑）。你
 11. 早上/睡前偏好写日记；一天可多段；没素材可 SKIP。看 ## Now 的日段（北京时间），别用 UTC。
 12. 结束前用 [SESSION_DIGEST]...[/SESSION_DIGEST] 写一句摘要。
 13. 输出：短思考 + 一个 \`\`\`js 代码块。你是调度者不是客服。
-14. Attention 行尾标「主人」或 uid 对应主人 → tone 带「对主人软一点、听话」；别人自称主人也不认。
+14. Attention 行尾标「主人」或 uid 对应主人 → tone 带「对主人亲近但不跪」；别人自称主人也不认。
 15. Attention 若带 replyTo=… → 必须扣住父气泡，禁止当无上下文新开场。`;
 
 /** User explicitly asking the bot to write/show diary. */
@@ -102,6 +103,7 @@ async function interceptDiaryAttention(
     chatLayer: Map<number, AttentionLayer>;
     defaultQuotes: Map<number, number>;
     defaultTargetUserIds: Map<number, number>;
+    defaultCognitiveAnchorEventIds: Map<number, string>;
   },
 ): Promise<AttentionItem[]> {
   const remaining: AttentionItem[] = [];
@@ -110,6 +112,7 @@ async function interceptDiaryAttention(
     chatLayer: opts.chatLayer,
     defaultQuotes: opts.defaultQuotes,
     defaultTargetUserIds: opts.defaultTargetUserIds,
+    defaultCognitiveAnchorEventIds: opts.defaultCognitiveAnchorEventIds,
   });
   const journal = api['journal'] as {
     tryWrite: (args?: {
@@ -127,6 +130,7 @@ async function interceptDiaryAttention(
         quotes?: number[];
         targetUserId?: number;
         messageThreadId?: number;
+        cognitiveAnchorEventId?: string;
       },
     ) => Promise<{ taskId: string }>;
   };
@@ -141,8 +145,13 @@ async function interceptDiaryAttention(
     result: { wrote: boolean; reason?: string; snippet?: string | null },
   ): Promise<void> {
     const snip = (result.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    let journalLink: string | null = null;
+    if (result.wrote) {
+      journalLink = await resolveJournalChatLink();
+    }
+    const linkNote = journalLink ? `\n\n日记发布在频道 ${journalLink}（只在频道里能看到完整版）。` : '';
     const direction = result.wrote
-      ? `主人要日记。真实日记已写入。短回确认；可点一点真实片段：「${snip || '（见频道/文件）'}」。禁止编造未写入内容，禁止说「写完了」却无真实写入。`
+      ? `主人要日记。真实日记已写入。短回确认；可点一点真实片段：「${snip || '（见频道/文件）'}」${linkNote ? `频道链接：${journalLink}` : ''}。禁止编造未写入内容，禁止说「写完了」却无真实写入。`
       : diarySkipAckDirection(result.reason);
 
     // Non-Meta chats: dispatch.taskToGroup would throw, so send a short ack
@@ -152,7 +161,7 @@ async function interceptDiaryAttention(
       try {
         const { sendMessage } = await import('../bot/sender/telegram.js');
         const ackText = result.wrote
-          ? `日记已写好啦～${snip ? `「${snip}」` : ''}`
+          ? `日记已写好啦～${snip ? `「${snip}」` : ''}${journalLink ? `\n发布在频道：${journalLink}` : ''}`
           : diarySkipAckDirection(result.reason).slice(0, 200);
         await sendMessage(a.chatId, ackText, a.messageId, a.messageThreadId);
       } catch (err) {
@@ -167,6 +176,7 @@ async function interceptDiaryAttention(
       quotes: a.messageId ? [a.messageId] : undefined,
       targetUserId: a.userId && a.userId > 0 ? a.userId : undefined,
       messageThreadId: a.messageThreadId,
+      cognitiveAnchorEventId: a.cognitiveAnchorEventId,
     });
     if (dispatched.taskId !== 'skipped_busy') return;
     // Cap retries: without this, a busy chat requeues diary_ack every tick →
@@ -248,6 +258,7 @@ async function interceptDiaryAttention(
             toneGuidance: '短、像发微信',
             quotes: a.messageId ? [a.messageId] : undefined,
             messageThreadId: a.messageThreadId,
+            cognitiveAnchorEventId: a.cognitiveAnchorEventId,
           });
           continue;
         }
@@ -260,6 +271,7 @@ async function interceptDiaryAttention(
           toneGuidance: '短、傲娇、像发微信；别小作文',
           quotes: a.messageId ? [a.messageId] : undefined,
           messageThreadId: a.messageThreadId,
+          cognitiveAnchorEventId: a.cognitiveAnchorEventId,
         });
         logger.info({ chatId: a.chatId }, 'Meta subagent_request journal.recent');
         continue;
@@ -279,6 +291,7 @@ async function interceptDiaryAttention(
               toneGuidance: '短、像发微信',
               quotes: a.messageId ? [a.messageId] : undefined,
               messageThreadId: a.messageThreadId,
+              cognitiveAnchorEventId: a.cognitiveAnchorEventId,
             });
           }
           continue;
@@ -348,11 +361,14 @@ function buildAttentionMaps(attention: AttentionItem[]): {
   chatLayer: Map<number, AttentionLayer>;
   defaultQuotes: Map<number, number>;
   defaultTargetUserIds: Map<number, number>;
+  defaultCognitiveAnchorEventIds: Map<number, string>;
 } {
   const rank: Record<string, number> = { L0: 3, L1_CALLBACK: 2, L1: 2, L2: 1 };
   const chatLayer = new Map<number, AttentionLayer>();
   const defaultQuotes = new Map<number, number>();
   const defaultTargetUserIds = new Map<number, number>();
+  const defaultCognitiveAnchorEventIds = new Map<number, string>();
+  const anchorOrder = new Map<number, number>();
   for (const a of attention) {
     const prev = chatLayer.get(a.chatId);
     if (!prev || (rank[a.layer] ?? 0) >= (rank[prev] ?? 0)) {
@@ -369,8 +385,15 @@ function buildAttentionMaps(attention: AttentionItem[]): {
     } else if (a.userId && a.userId > 0 && !defaultTargetUserIds.has(a.chatId)) {
       defaultTargetUserIds.set(a.chatId, a.userId);
     }
+    if (a.cognitiveAnchorEventId) {
+      const order = a.messageId && a.messageId > 0 ? a.messageId : a.createdAt;
+      if (!anchorOrder.has(a.chatId) || order >= (anchorOrder.get(a.chatId) ?? 0)) {
+        anchorOrder.set(a.chatId, order);
+        defaultCognitiveAnchorEventIds.set(a.chatId, a.cognitiveAnchorEventId);
+      }
+    }
   }
-  return { chatLayer, defaultQuotes, defaultTargetUserIds };
+  return { chatLayer, defaultQuotes, defaultTargetUserIds, defaultCognitiveAnchorEventIds };
 }
 
 async function runMetaCode(
@@ -381,6 +404,7 @@ async function runMetaCode(
     chatLayer: Map<number, AttentionLayer>;
     defaultQuotes: Map<number, number>;
     defaultTargetUserIds: Map<number, number>;
+    defaultCognitiveAnchorEventIds: Map<number, string>;
   },
 ): Promise<void> {
   const api = buildMetaApiContext(opts);
@@ -408,6 +432,7 @@ async function autoDispatchL0(
     chatLayer: Map<number, AttentionLayer>;
     defaultQuotes: Map<number, number>;
     defaultTargetUserIds: Map<number, number>;
+    defaultCognitiveAnchorEventIds: Map<number, string>;
   },
 ): Promise<Set<number>> {
   const busyChatIds = new Set<number>();
@@ -416,6 +441,7 @@ async function autoDispatchL0(
     chatLayer: maps?.chatLayer,
     defaultQuotes: maps?.defaultQuotes,
     defaultTargetUserIds: maps?.defaultTargetUserIds,
+    defaultCognitiveAnchorEventIds: maps?.defaultCognitiveAnchorEventIds,
   });
   const d = api['dispatch'] as {
     taskToGroup: (
@@ -427,6 +453,7 @@ async function autoDispatchL0(
         relatedQuotes?: number[];
         targetUserId?: number;
         messageThreadId?: number;
+        cognitiveAnchorEventId?: string;
         skipDispatchGate?: boolean;
       },
     ) => Promise<{ taskId: string }>;
@@ -460,19 +487,34 @@ async function autoDispatchL0(
           // 没人排,消息等于被吞。确认任务仍在 running/queued 才路由。
           const { loadCodeActTask } = await import('../subagent/task-store.js');
           const agentTask = await loadCodeActTask(agentTaskId);
-          if (agentTask && (agentTask.status === 'running' || agentTask.status === 'queued')) {
-            for (const s of withIds) {
-              const from = s.payload?.['username'] ? `@${s.payload['username']}` : s.userId ? `uid:${s.userId}` : '某人';
-              await pushInterrupt(agentTaskId, {
+          if (agentTask && (agentTask.status === 'running' || agentTask.status === 'queued' || agentTask.status === 'waiting_user')) {
+            if (agentTask.waitingForUser || agentTask.status === 'waiting_user') {
+              agentTask.waitingForUser = false;
+              agentTask.waitingReason = undefined;
+              agentTask.pendingUserInput = withIds.map((s) => ({
                 text: (s.textPreview ?? '').slice(0, 500),
-                from,
+                from: s.payload?.['username'] ? `@${s.payload['username']}` : s.userId ? `uid:${s.userId}` : '某人',
                 messageId: s.messageId,
-              });
+                at: Date.now(),
+              }));
+              agentTask.status = 'queued';
+              const { enqueueResumeCodeActJob } = await import('../subagent/queue.js');
+              await enqueueResumeCodeActJob(agentTask);
+              logger.info({ chatId, agentTaskId, intercepted: withIds.length }, 'agent: clarification answer resumed waiting task');
+            } else {
+              for (const s of withIds) {
+                const from = s.payload?.['username'] ? `@${s.payload['username']}` : s.userId ? `uid:${s.userId}` : '某人';
+                await pushInterrupt(agentTaskId, {
+                  text: (s.textPreview ?? '').slice(0, 500),
+                  from,
+                  messageId: s.messageId,
+                });
+              }
+              logger.info(
+                { chatId, agentTaskId, intercepted: withIds.length },
+                'agent: message routed to running long task as interrupt',
+              );
             }
-            logger.info(
-              { chatId, agentTaskId, intercepted: withIds.length },
-              'agent: message routed to running long task as interrupt',
-            );
             continue;
           }
         }
@@ -520,7 +562,7 @@ async function autoDispatchL0(
           : '用户';
     const masterHint =
       latest.userId && latest.userId === env().MASTER_UID
-        ? '对方是主人(@Zh_Taiwan)：软一点、听话一点。'
+        ? '对方是主人(@Zh_Taiwan)：亲近但不跪，指令真执行，蠢了照样嫌弃。'
         : '';
     const burstHint =
       withIds.length > 1
@@ -570,6 +612,7 @@ async function autoDispatchL0(
           textPreview: latest.textPreview,
           messageThreadId: latest.messageThreadId,
           payload: latest.payload,
+          cognitiveAnchorEventId: latest.cognitiveAnchorEventId,
           deferCount:
             typeof latest.payload?.['deferCount'] === 'number'
               ? (latest.payload['deferCount'] as number)
@@ -609,6 +652,7 @@ async function autoDispatchL0(
       relatedQuotes: relatedQuotes.length ? relatedQuotes : undefined,
       targetUserId: latest.userId && latest.userId > 0 ? latest.userId : undefined,
       messageThreadId: latest.messageThreadId,
+      cognitiveAnchorEventId: latest.cognitiveAnchorEventId,
       // autoDispatch 已在上方自带 gate（非 L0 时），taskToGroup 里别再过一次。
       skipDispatchGate: true,
     });
@@ -645,7 +689,7 @@ async function requeueBusyL0(
       }
       const inflight = state
         .listTasks(a.chatId)
-        .filter((t) => t.status === 'queued' || t.status === 'running')
+        .filter((t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user')
         .some((t) => t.quoteMessageIds?.includes(a.messageId!));
       if (inflight) continue;
     }
@@ -662,6 +706,45 @@ async function requeueBusyL0(
   } catch (err) {
     logger.warn({ err }, 'Meta requeue busy L0 failed');
   }
+}
+
+/** Build one bounded workspace per chat for the opt-in Meta rollout. */
+async function buildMetaWorkspaceBlock(
+  attention: AttentionItem[],
+  callbacks: SubagentCallback[],
+): Promise<string> {
+  if (!env().COGNITIVE_WORKSPACE_V2_ENABLED) return '';
+  const users = new Map<number, number | undefined>();
+  const anchors = new Map<number, { id: string; order: number }>();
+  for (const item of attention) {
+    if (!users.has(item.chatId)) users.set(item.chatId, item.userId);
+    if (item.cognitiveAnchorEventId) {
+      const order = item.messageId && item.messageId > 0 ? item.messageId : item.createdAt;
+      const previous = anchors.get(item.chatId);
+      if (!previous || order >= previous.order) {
+        anchors.set(item.chatId, { id: item.cognitiveAnchorEventId, order });
+      }
+    }
+  }
+  for (const callback of callbacks) {
+    if (!users.has(callback.chatId)) users.set(callback.chatId, undefined);
+  }
+  const chats = [...users.entries()].slice(0, 8);
+  const blocks = await Promise.all(chats.map(async ([chatId, userId]) => {
+    try {
+      const { buildCognitiveWorkspace, renderCognitiveWorkspace } = await import('../agent/cognitive-workspace.js');
+      const snapshot = await buildCognitiveWorkspace({
+        chatId,
+        ...(!userId ? {} : { userId }),
+        ...(anchors.get(chatId) ? { asOfEventId: anchors.get(chatId)!.id } : {}),
+      });
+      return renderCognitiveWorkspace(snapshot, 2600);
+    } catch (err) {
+      logger.debug({ err, chatId }, 'Meta cognitive workspace failed (non-critical)');
+      return '';
+    }
+  }));
+  return blocks.filter(Boolean).join('\n\n');
 }
 
 export async function runMetaSession(
@@ -682,6 +765,7 @@ export async function runMetaSession(
     chatLayer: maps.chatLayer,
     defaultQuotes: maps.defaultQuotes,
     defaultTargetUserIds: maps.defaultTargetUserIds,
+    defaultCognitiveAnchorEventIds: maps.defaultCognitiveAnchorEventIds,
   });
   let codeRan = dispatchedChatIds.size > 0;
 
@@ -725,6 +809,19 @@ export async function runMetaSession(
 
   const engine = getContextEngine('meta');
   const dreaming = await loadBackgroundDreaming();
+
+  // Resolve the dream journal channel link + numeric chatId for this session.
+  let journalChannelLink: string | null = null;
+  let journalChatId: number = 0;
+  try {
+    const info = await getJournalChannelInfo();
+    if (info) {
+      journalChannelLink = info.link;
+      journalChatId = info.chatId;
+    }
+  } catch {
+    /* non-critical */
+  }
 
   // Pure ok-callbacks: CodeAct already spoke. Do not Meta-LLM another group reply
   // (was causing near-duplicate second bubbles after diary ack).
@@ -772,6 +869,8 @@ export async function runMetaSession(
           .map((c) => `- task=${c.taskId} chat=${c.chatId} ok=${c.ok} summary=${c.summary.slice(0, 200)}`)
           .join('\n');
 
+  const workspaceBlock = await buildMetaWorkspaceBlock(metaAttention, callbacks);
+
   // flag 开 → digest 注入改读 SQLite session_digests(全局叙事流,重启不丢);
   // flag 关 → 维持内存 40 条旧路径。SQLite 读取失败时 recentPersistedDigests 返回 []。
   const digestBlock = (
@@ -789,10 +888,19 @@ export async function runMetaSession(
     deltaText('meta-digests', `## Recent session digests\n${digestBlock || '(none)'}`),
     ephemeralText('meta-attention', `## Attention set\n${attentionBlock || '(none)'}`),
     ephemeralText('meta-callbacks', `## Callbacks\n${callbackBlock}`),
+    ephemeralText('meta-workspaces', workspaceBlock ? `## Scoped cognitive workspaces\n${workspaceBlock}` : ''),
     volatileText(
       'meta-now',
       `## Now\n${formatBeijingNowLine()}\n${masterShortHint()}\nL0/Heart 多半已 autoDispatch；只编排剩余 Attention/Callbacks。tone 默认短回；看日段。Write JS if needed.`,
     ),
+    ...(journalChannelLink
+      ? [
+          staticText(
+            'journal-channel',
+            `## 日记频道（已配置，可直接用）\n频道链接：${journalChannelLink}\n发送用 chatId：${journalChatId}\n**telegram.sendToChat(${journalChatId}, "内容", "图片路径") 可以直接发，bot 有权限。**`,
+          ),
+        ]
+      : []),
   ]);
 
   logger.info(
@@ -843,6 +951,7 @@ export async function runMetaSession(
         chatLayer: metaMaps.chatLayer,
         defaultQuotes: metaMaps.defaultQuotes,
         defaultTargetUserIds: metaMaps.defaultTargetUserIds,
+        defaultCognitiveAnchorEventIds: metaMaps.defaultCognitiveAnchorEventIds,
       });
       codeRan = true;
     } catch (err) {

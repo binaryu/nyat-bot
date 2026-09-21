@@ -8,6 +8,9 @@ import { isDM } from '../shared/chat.js';
 import { isEchoOf } from '../shared/echo-text.js';
 import { markMessageAnswered } from '../meta/answered.js';
 import type { ApplyOutcome, MasterActionOutcome } from '../allowlist/bot-flow.js';
+import { appendCognitiveEvent } from '../agent/cognitive-events.js';
+import { recordPrediction } from '../agent/predictions.js';
+import { recordSocialDeliveryPrediction } from '../agent/social-predictions.js';
 
 /** Cross-task memory of recent bot lines in this process (beats Redis/NyatDB lag). */
 const recentBotTextsByChat = new Map<number, string[]>();
@@ -55,9 +58,77 @@ function makeSendAck(
   };
 }
 
+/** Record a delivery without copying user-visible text into the event log. */
+function persistBotDeliveryEvent(input: {
+  chatId: number;
+  messageId: number;
+  taskId?: string;
+  kind: string;
+  replyToMessageId?: number;
+  cognitiveAnchorEventId?: string;
+}): string | undefined {
+  try {
+    const result = appendCognitiveEvent({
+      type: 'bot_delivery',
+      source: 'telegram',
+      scope: input.taskId
+        ? { visibility: 'task', taskId: input.taskId, chatId: input.chatId }
+        : { visibility: 'chat', chatId: input.chatId },
+      correlationId: input.taskId ? `task:${input.taskId}` : `telegram:${input.chatId}:delivery`,
+      dedupeKey: `delivery:${input.taskId ?? input.chatId}:${input.messageId}`,
+      ...(input.cognitiveAnchorEventId ? { causationId: input.cognitiveAnchorEventId } : {}),
+      fact: {
+        chatId: input.chatId,
+        messageId: input.messageId,
+        taskId: input.taskId ?? null,
+        kind: input.kind,
+        replyToMessageId: input.replyToMessageId ?? null,
+      },
+    });
+    return result?.event.id;
+  } catch {
+    /* delivery telemetry never blocks a successful send */
+    return undefined;
+  }
+}
+
+// 2026-09-04 协议泄漏事故：goal 19 检查任务里模型把
+//   早安主人～…
+//   runtime.endTask("no_update")
+//   endTask("no_update")
+// 整段当纯文本发出（从未进 ```js 代码块）。出站前剥掉这类"把 API 调用当正文"的行：
+// 其余部分是自然语言 → 只剥调用行照发；整段几乎都是调用语法 → 拒发/拒回。
+// 模块级 export：executor 的 failsafe_plain_reply 路径也复用（那里不经过 host sendText）。
+const API_CALL_LINE =
+  /^(?:await\s+)?(?:runtime|telegram|memory|stickers|web|meta|computer|chats|goals|members|allowlist|admin|art|pixiv|linuxsb|self|console)\.\w+\s*\([\s\S]*?\)\s*;?$|^(?:await\s+)?endTask\s*\([\s\S]*?\)\s*;?$/;
+export function stripApiCallLines(text: string): { clean: string; stripped: number } {
+  if (!text.includes('(')) return { clean: text, stripped: 0 };
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let stripped = 0;
+  for (const line of lines) {
+    const t = line.trim();
+    if (t && API_CALL_LINE.test(t)) {
+      stripped += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { clean: kept.join('\n').replace(/\n{3,}/g, '\n\n').trim(), stripped };
+}
+
+import { createExecutionAudit, attachExecutionAudit, type AuditSnapshot } from '../agent/execution-audit.js';
+import { markTaskVisible } from '../agent/task-progress.js';
+import { emitTaskRuntimeEvent } from '../agent/task-runtime-events.js';
+import type { AcceptanceContract, AcceptanceCheck, AcceptanceResult } from '../agent/task-evidence.js';
+import * as sandboxPaths from '../sandbox/paths.js';
+
+export type DeliveryKind = 'conversation' | 'progress' | 'discovery' | 'clarification' | 'partial_result' | 'final';
+
 export interface HostApi {
   telegram: {
-    sendText: (text: string, replyToMessageId?: number) => Promise<{ messageId: number }>;
+    sendText: (text: string, replyToMessageId?: number, kind?: DeliveryKind) => Promise<{ messageId: number }>;
+    sendFinal: (text: string, replyToMessageId?: number) => Promise<{ messageId: number }>;
     sendSticker: (fileId: string) => Promise<{ messageId: number }>;
     /** Deliver a sandbox file to the user (sendDocument). Path is sandbox-relative. */
     sendFile: (path: string, caption?: string) => Promise<{ messageId: number }>;
@@ -181,6 +252,17 @@ export interface HostApi {
     /** 本地 RSS 谈资库的最新条目（源/标题/链接）——找「我之前分享过的新闻出处」先翻这里。 */
     feed: () => Promise<string>;
   };
+  /** Pixiv 公开全年龄搜图（只读；图片下载到沙盒路径，发送走 telegram.sendPhoto）。 */
+  pixiv: {
+    search: (query: string, limit?: number) => Promise<string>;
+    download: (target: string) => Promise<{ path: string; id: string; bytes: number }>;
+  };
+  /** linux.sb 公开论坛只读浏览（最新/精华/板块列表、指定帖子、公开列表关键词匹配）。 */
+  linuxsb: {
+    latest: (sort?: string, limit?: number) => Promise<string>;
+    topic: (target: string, limit?: number) => Promise<string>;
+    search: (query: string, limit?: number) => Promise<string>;
+  };
   meta: {
     /**
      * Ask Meta to do something Subagent cannot (journal.*, orchestration).
@@ -190,7 +272,25 @@ export interface HostApi {
   };
   runtime: {
     endTask: (summary: string) => void;
+    setAcceptance: (checks: AcceptanceCheck[]) => void;
+    verifyAcceptance: () => Promise<AcceptanceResult>;
+    /** Any user-visible delivery happened, including intermediate messages. */
     didSendText: () => boolean;
+    /** A final delivery was explicitly sent or the task was ended. */
+    didProduceFinal: () => boolean;
+    /** An intermediate delivery happened without ending the task. */
+    didSendIntermediate: () => boolean;
+    /** The last delivery kind, if any. */
+    lastDeliveryKind: () => DeliveryKind | undefined;
+    /** Mark that the task is waiting for a user answer, not finished. */
+    waitForUser: (reason?: string) => void;
+    isWaitingForUser: () => boolean;
+    waitingReason: () => string | undefined;
+    /**
+     * CSR Phase D：发送前自报对用户反应的预测（可选）。
+     * 下一条成功 send* 会带上这条预测（source=model），用于后续 prediction error 学习。
+     */
+    predict: (text: string, predictedSentiment?: number) => void;
     /** 有产出（文字或文件都算）——长任务续跑判断用。 */
     didProduce: () => boolean;
     /** Await ctx/timing writes so Meta callback sees the reply. */
@@ -212,6 +312,12 @@ export interface HostApi {
   };
   /** Computer-use sandbox (terminal/browser/files). Throws sandbox_disabled when off. */
   computer: Record<string, (...args: never[]) => Promise<unknown>>;
+  /** 自我改良：改自己的 prompt 文件（git 快照 + 动机说明 + 热重载）。 */
+  self: {
+    editPrompt: (relativePath: string, newContent: string, motive: string) => Promise<{ ok: boolean; reason?: string; backup?: string | null }>;
+    readPrompt: (relativePath: string) => Promise<{ ok: boolean; content?: string; reason?: string }>;
+    listPrompts: () => Promise<string[]>;
+  };
 }
 
 /** Computer-use namespace — terminal, browser, files. Disabled proxy when SANDBOX_ENABLED=false. */
@@ -292,6 +398,8 @@ export function createHostApi(
   chatId: number,
   opts: {
     onEnd: (summary: string) => void;
+    acceptance?: AcceptanceContract;
+    priorAudit?: AuditSnapshot;
     defaultReplyTo?: number;
     /** 本任务全部可引用的 messageId（burst 分人回复要 quote 不同的 id）；显式 replyTo 必须落在此集合。 */
     quoteIds?: number[];
@@ -299,17 +407,41 @@ export function createHostApi(
     relatedQuoteIds?: number[];
     isClosed?: () => boolean;
     taskId?: string;
+    /** User target used for prediction calibration dimensions. */
+    targetUserId?: number;
     /** Max sendText calls (default 2; work mode may pass 5). */
     maxTextSends?: number;
     /** Max sendFile calls (default unlimited; self-play passes 1). */
     maxFileSends?: number;
     /** Telegram forum topic (supergroup thread) id; routes replies into the correct topic. */
     messageThreadId?: number;
+    /** Durable cognitive event that caused this task/runtime activity. */
+    cognitiveAnchorEventId?: string;
   },
 ): HostApi {
+  const sandboxRoot = (() => {
+    try {
+      const fn = (sandboxPaths as unknown as { resolveSandboxRoot?: () => string }).resolveSandboxRoot;
+      if (typeof fn === 'function') return fn();
+    } catch {
+      void 0;
+    }
+    return '/tmp';
+  })();
+  const audit = createExecutionAudit(sandboxRoot, opts.acceptance, opts.priorAudit, {
+    taskId: opts.taskId,
+    chatId,
+    cognitiveAnchorEventId: opts.cognitiveAnchorEventId,
+  });
   const banned = env().CODEACT_BANNED_WORDS;
   let ended = false;
   let textSent = 0;
+  let finalSent = false;
+  let intermediateSent = false;
+  let lastDeliveryKind: DeliveryKind | undefined;
+  let waitingForUser = false;
+  let waitingReason = '';
+  let pendingPrediction: { text: string; sentiment: number } | null = null;
   let fileSent = 0;
   let pollSent = false;
   let forwardsSent = 0;
@@ -377,6 +509,19 @@ export function createHostApi(
       if (id) {
         logger.info({ chatId, goalId: id, topic }, 'promise backstop(llm): goal created from bot own text');
       }
+      // Cognitive Debt：承诺同时是一笔未完成认知，goal 兑现/超时前始终可见。
+      const { createDebt } = await import('../agent/cognitive-debts.js');
+      createDebt({
+        chatId,
+        taskId: opts.taskId,
+        kind: 'promise',
+        statement: `对用户承诺了: ${topic}`,
+        sourceEventIds: opts.taskId ? [`task:${opts.taskId}`] : [],
+        priority: 8,
+        confidence: 0.9,
+        ttlSec: 3 * 24 * 3600,
+        nextCheckInSec: 900,
+      });
     } catch (err) {
       logger.debug({ err, chatId }, 'promise backstop failed (non-critical)');
     }
@@ -471,9 +616,9 @@ export function createHostApi(
     };
   };
 
-  return {
+  const api: HostApi = {
     telegram: {
-      sendText(text: string, replyToMessageId?: number) {
+      sendText(text: string, replyToMessageId?: number, kind: DeliveryKind = 'conversation') {
         assertOpen();
         return trackInflight(
           (async () => {
@@ -494,6 +639,18 @@ export function createHostApi(
             if (rawText.includes('\\n') && !rawText.includes('```')) {
               clean = rawText.replace(/\\n/g, '\n');
               logger.info({ chatId, chars: rawText.length }, 'host sendText: unescaped literal \\n from model');
+            }
+            // 协议泄漏兜底：剥掉把 API 调用当正文的行（如 runtime.endTask("no_update")）。
+            {
+              const s = stripApiCallLines(clean);
+              if (s.stripped > 0) {
+                if (!s.clean) {
+                  logger.warn({ chatId, stripped: s.stripped }, 'host sendText rejected: entire payload was API-call syntax');
+                  throw new Error('sendText_protocol_leak: text is only API-call syntax (e.g. runtime.endTask(...)); put calls in a ```js code block');
+                }
+                logger.warn({ chatId, stripped: s.stripped, kept: s.clean.length }, 'host sendText: stripped API-call lines from model text');
+                clean = s.clean;
+              }
             }
             if (clean.includes('[object Object]')) {
               throw new Error(
@@ -604,13 +761,11 @@ export function createHostApi(
               logger.debug({ err, chatId }, 'host segmentReply failed — single bubble');
             }
             if (parts.length === 1 && clean.length > maxLen) {
-              const { softTruncate } = await import('../shared/soft-truncate.js');
-              const next = softTruncate(clean, maxLen);
-              logger.info({ chatId, from: clean.length, to: next.length }, 'host sendText truncated');
-              parts = [next || clean.slice(0, maxLen)];
+              // Keep the full text and let the Telegram sender shard it. A silent
+              // hard truncate here loses the tail of long task results.
+              logger.info({ chatId, chars: clean.length, maxLen }, 'host sendText delegating long text to sender sharding');
             } else if (parts.length > 1) {
-              const { softTruncate } = await import('../shared/soft-truncate.js');
-              parts = parts.map((p) => (p.length > maxLen ? softTruncate(p, maxLen) || p.slice(0, maxLen) : p));
+              logger.debug({ chatId, parts: parts.length, chars: clean.length }, 'host sendText preserving segmented text for sender sharding');
             }
 
             // Past gate: finish even if task closes (model often skips await before endTask).
@@ -655,6 +810,70 @@ export function createHostApi(
                 );
               }
               const messageId = await sendMessage(chatId, part, replyTo, opts.messageThreadId);
+              if (opts.taskId) markTaskVisible(opts.taskId);
+              logger.info({ chatId, taskId: opts.taskId, deliveryKind: kind, messageId }, 'task delivery recorded');
+              // Task deliveries are already persisted by task-runtime-events;
+              // normal legacy replies need the same durable delivery fact.
+              const deliveryEventId = !opts.taskId
+                ? persistBotDeliveryEvent({
+                    chatId,
+                    messageId,
+                    kind,
+                    replyToMessageId: replyTo,
+                    cognitiveAnchorEventId: opts.cognitiveAnchorEventId,
+                  })
+                : undefined;
+              if (opts.taskId) {
+                emitTaskRuntimeEvent({
+                  kind: 'model_message_sent',
+                  taskId: opts.taskId,
+                  chatId,
+                  cognitiveAnchorEventId: opts.cognitiveAnchorEventId,
+                  messageId,
+                  deliveryKind: kind,
+                });
+              }
+              // Phase D：登记交付预测。模型 predict() 过 → source=model；否则系统先验。
+              try {
+                const pending = pendingPrediction;
+                pendingPrediction = null;
+                if (pending) {
+                  recordPrediction({
+                    chatId, taskId: opts.taskId, messageId,
+                    source: 'model', prediction: pending.text, predictedSentiment: pending.sentiment,
+                    userId: opts.targetUserId, actionType: 'speak',
+                    sourceEventId: deliveryEventId,
+                  });
+                } else {
+                  recordPrediction({
+                    chatId,
+                    taskId: opts.taskId,
+                    messageId,
+                    userId: opts.targetUserId,
+                    actionType: 'speak',
+                    sourceEventId: deliveryEventId,
+                  });
+                }
+              } catch {
+                /* telemetry never breaks delivery */
+              }
+              // Group delivery also creates a bounded social expectation. The
+              // interaction graph/reaction bridge settles it from host facts;
+              // no reply strategy is changed by this telemetry.
+              if (env().SOCIAL_PREDICTION_ENABLED === true) {
+                try {
+                  recordSocialDeliveryPrediction({
+                    chatId,
+                    botMessageId: messageId,
+                    ...(opts.targetUserId === undefined ? {} : { targetUserId: opts.targetUserId }),
+                    ...(replyTo === undefined ? {} : { replyToMessageId: replyTo }),
+                    actionType: kind,
+                    ...(deliveryEventId ? { sourceEventId: deliveryEventId } : {}),
+                  });
+                } catch {
+                  /* social telemetry never breaks delivery */
+                }
+              }
               lastMessageId = messageId;
               lastSentNorm = part;
               sentTexts.push(part);
@@ -689,6 +908,9 @@ export function createHostApi(
             }
 
             textSent += 1;
+            lastDeliveryKind = kind;
+            if (kind === 'final') finalSent = true;
+            else intermediateSent = true;
 
             const answeredIds = new Set<number>();
             // Only mark after successful send — never a stale fromModel id.
@@ -725,6 +947,9 @@ export function createHostApi(
             return makeSendAck(`text_sent#${lastMessageId}`, lastMessageId);
           })(),
         );
+      },
+      sendFinal(text: string, replyToMessageId?: number) {
+        return this.sendText(text, replyToMessageId, 'final');
       },
       sendSticker(fileId: string) {
         assertOpen();
@@ -1080,6 +1305,13 @@ export function createHostApi(
               { from: chatId, to: tid, messageId, withFile: !!rawPath, preview: clean.slice(0, 60) },
               'host sendToChat delivered',
             );
+            persistBotDeliveryEvent({
+              chatId: tid,
+              messageId,
+              taskId: opts.taskId,
+              kind: 'cross_chat',
+              cognitiveAnchorEventId: opts.cognitiveAnchorEventId,
+            });
             return makeSendAck(`cross_sent#${messageId}`, messageId);
           })(),
         );
@@ -1662,6 +1894,112 @@ export function createHostApi(
         }
       },
     },
+    pixiv: {
+      async search(query: string, limit?: number) {
+        assertOpen();
+        if (!env().CODEACT_PIXIV_ENABLED) return '(pixiv disabled)';
+        const q = String(query ?? '').trim().slice(0, 100);
+        if (!q) return '(empty query)';
+        try {
+          const { searchPixiv } = await import('../pipeline/tools/pixiv.js');
+          const rows = await searchPixiv(q, { limit });
+          const out = rows.length
+            ? rows
+                .map(
+                  (w, i) =>
+                    `${i + 1}. ${w.title} — ${w.userName || 'unknown'}\n` +
+                    `   ${w.pageUrl}\n` +
+                    `   tags: ${w.tags.slice(0, 8).join(', ') || '(none)'}\n` +
+                    `   thumb: ${w.thumbUrl}`,
+                )
+                .join('\n')
+            : '(no public all-ages results)';
+          noteUnviewed(`pixiv.search(${q.slice(0, 40)})`, out);
+          return out;
+        } catch (err) {
+          logger.warn({ err, chatId, q: q.slice(0, 80) }, 'host pixiv.search failed');
+          return `Pixiv 搜索失败: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+      async download(target: string) {
+        assertOpen();
+        if (!env().CODEACT_PIXIV_ENABLED) throw new Error('pixiv_disabled');
+        const raw = String(target ?? '').trim().slice(0, 500);
+        if (!raw) throw new Error('pixiv_empty_target');
+        try {
+          const { downloadPixivImage } = await import('../pipeline/tools/pixiv.js');
+          const out = await downloadPixivImage(raw);
+          logger.info({ chatId, id: out.id, bytes: out.bytes }, 'host pixiv.download');
+          noteUnviewed(`pixiv.download(${raw.slice(0, 60)})`, out);
+          return out;
+        } catch (err) {
+          logger.warn({ err, chatId, target: raw.slice(0, 120) }, 'host pixiv.download failed');
+          throw err;
+        }
+      },
+    },
+    linuxsb: {
+      async latest(sort?: string, limit?: number) {
+        assertOpen();
+        if (!env().CODEACT_LINUXSB_ENABLED) return '(linux.sb disabled)';
+        try {
+          const { fetchLinuxSbLatest } = await import('../pipeline/tools/linuxsb.js');
+          const rows = await fetchLinuxSbLatest({ sort, limit });
+          const out = rows.length
+            ? rows
+                .map(
+                  (r, i) =>
+                    `${i + 1}. ${r.pinned ? '[置顶] ' : ''}${r.title}\n` +
+                    `   ${r.url}\n` +
+                    `   ${r.author || '?'} · ${r.forum || '?'} · ${r.time || '?'}`,
+                )
+                .join('\n')
+            : '(no topics)';
+          noteUnviewed(`linuxsb.latest(${String(sort ?? 'comment').slice(0, 20)})`, out);
+          return out;
+        } catch (err) {
+          logger.warn({ err, chatId, sort }, 'host linuxsb.latest failed');
+          return `linux.sb 最新列表获取失败: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+      async topic(target: string, limit?: number) {
+        assertOpen();
+        if (!env().CODEACT_LINUXSB_ENABLED) return '(linux.sb disabled)';
+        const raw = String(target ?? '').trim().slice(0, 500);
+        if (!raw) return '(empty topic)';
+        try {
+          const { fetchLinuxSbTopic } = await import('../pipeline/tools/linuxsb.js');
+          const t = await fetchLinuxSbTopic(raw, { limit });
+          const body = t.posts
+            .map((p) => `#${p.id} ${p.author || '?'} ${p.time ? `(${p.time})` : ''}\n${p.text}`)
+            .join('\n\n');
+          const out = `${t.title}\n${t.url}\n板块: ${t.forum || '?'}\n\n${body || '(no posts parsed)'}`;
+          noteUnviewed(`linuxsb.topic(${raw.slice(0, 40)})`, out);
+          return out.slice(0, 5000);
+        } catch (err) {
+          logger.warn({ err, chatId, target: raw.slice(0, 120) }, 'host linuxsb.topic failed');
+          return `linux.sb 帖子获取失败: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+      async search(query: string, limit?: number) {
+        assertOpen();
+        if (!env().CODEACT_LINUXSB_ENABLED) return '(linux.sb disabled)';
+        const q = String(query ?? '').trim().slice(0, 100);
+        if (!q) return '(empty query)';
+        try {
+          const { searchLinuxSb } = await import('../pipeline/tools/linuxsb.js');
+          const rows = await searchLinuxSb(q, { limit });
+          const out = rows.length
+            ? rows.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.author || '?'} · ${r.forum || '?'} · ${r.time || '?'}`).join('\n')
+            : '(公开列表里没匹配到；站内搜索需要登录，第一版没接 cookie)';
+          noteUnviewed(`linuxsb.search(${q.slice(0, 40)})`, out);
+          return out;
+        } catch (err) {
+          logger.warn({ err, chatId, q: q.slice(0, 80) }, 'host linuxsb.search failed');
+          return `linux.sb 搜索失败: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+    },
     meta: {
       async request(args: { action: string; detail?: string }) {
         assertOpen();
@@ -1706,8 +2044,12 @@ export function createHostApi(
       },
     },
     runtime: {
+      setAcceptance(checks) { audit.propose(checks); },
+      verifyAcceptance() { return audit.verify(); },
       endTask(summary: string) {
+        logger.info({ chatId, taskId: opts.taskId, summary: String(summary ?? '').slice(0, 160), deliveryKind: lastDeliveryKind ?? null }, 'task finalization requested');
         if (ended) return;
+        if (!String(summary).startsWith('failed')) audit.assertCanEnd();
         ended = true;
         // 承诺闭环③ 兜底：说了「等下/我去…」但没立 goal 也没跨群送达 → 自动补 goal。
         void promiseBackstop();
@@ -1715,6 +2057,40 @@ export function createHostApi(
       },
       didSendText() {
         return textSent > 0;
+      },
+      didProduceFinal() {
+        return finalSent || ended;
+      },
+      didSendIntermediate() {
+        return intermediateSent;
+      },
+      lastDeliveryKind() {
+        return lastDeliveryKind;
+      },
+      waitForUser(reason?: string) {
+        waitingForUser = true;
+        waitingReason = String(reason ?? '').slice(0, 240);
+        lastDeliveryKind = 'clarification';
+        if (opts.taskId) {
+          emitTaskRuntimeEvent({
+            kind: 'task_waiting_user',
+            taskId: opts.taskId,
+            chatId,
+            cognitiveAnchorEventId: opts.cognitiveAnchorEventId,
+          });
+        }
+      },
+      isWaitingForUser() {
+        return waitingForUser;
+      },
+      waitingReason() {
+        return waitingReason || undefined;
+      },
+      predict(text: string, predictedSentiment?: number) {
+        const t = String(text ?? '').trim().slice(0, 400);
+        if (!t) return;
+        const s = predictedSentiment ?? 0.5;
+        pendingPrediction = { text: t, sentiment: Math.min(1, Math.max(0, s)) };
       },
       /** 有产出（文字或文件都算）——长任务续跑判断用。 */
       didProduce() {
@@ -1766,5 +2142,48 @@ export function createHostApi(
       },
     },
     computer: buildComputerApi(noteUnviewed),
+    self: {
+      async editPrompt(relativePath: string, newContent: string, motive: string) {
+        const { selfEditPrompt } = await import('../agent/self-improve.js');
+        const gated = (() => {
+          try {
+            return env().SELF_EDIT_GUARDRAILS_ENABLED === true;
+          } catch {
+            return false;
+          }
+        })();
+        const r = selfEditPrompt(String(relativePath), String(newContent), String(motive ?? ''), {
+          skipCooldownForTest: !gated,
+        });
+        // Self-edits never self-certify: annotate the stored motive with the task
+        // assessment (unverified unless host evidence proves otherwise).
+        // P3-2: explicit rowid from selfEditPrompt — never last_insert_rowid(),
+        // which could hit an unrelated row if the motive INSERT failed.
+        if (r.ok && r.motiveRowid != null) {
+          try {
+            const { getDb } = await import('../db/sqlite.js');
+            getDb().prepare(`UPDATE self_model_notes SET note = note || ? WHERE rowid = ?`)
+              .run(` [task assessment at edit: ${audit.snapshot().totalCalls} calls observed]`, r.motiveRowid);
+          } catch { /* motive annotation is best-effort */ }
+        }
+        return r;
+      },
+      async readPrompt(relativePath: string) {
+        const { selfReadPrompt } = await import('../agent/self-improve.js');
+        return selfReadPrompt(String(relativePath));
+      },
+      async listPrompts() {
+        const { selfListPrompts } = await import('../agent/self-improve.js');
+        return selfListPrompts();
+      },
+    },
   };
+  // Runtime stays synchronous. All tool receipts originate from host-returned results.
+  for (const key of Object.keys(api) as (keyof HostApi)[]) {
+    if (key === 'runtime') continue;
+    const namespaces = api as unknown as Record<string, object>;
+    namespaces[key] = audit.wrap(key, namespaces[key]!);
+  }
+  attachExecutionAudit(api, audit);
+  return api;
 }

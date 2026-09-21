@@ -17,6 +17,28 @@ import { env } from '../env.js';
 import { logger } from '../shared/logger.js';
 import { isAsleep } from '../tracking/sleep.js';
 import { isWithinActiveHours } from './active-hours.js';
+import { classifyCognitiveRoute, shouldApplyCognitiveRoute, type CognitiveRoutingDecision } from '../agent/cognitive-routing.js';
+import { getLatestTelegramMessageEventId } from '../agent/cognitive-events.js';
+
+// Phase 3：TickAction → CandidateAction（suppressor 打分形状）。quiet 无映射。
+function toCandidate(a: TickAction): import('../core/drives/score.js').CandidateAction | null {
+  switch (a.type) {
+    case 'care_master':
+      return { type: 'care_master' };
+    case 'group_speak':
+      return { type: 'group_speak', chatId: a.chatId };
+    case 'remember_user':
+      return { type: 'remember_user', chatId: a.chatId };
+    case 'self_play':
+      return { type: 'self_play' };
+    case 'check_goal':
+      return { type: 'check_goal', goalId: a.goalId };
+    case 'share':
+      return { type: 'share', fromChatId: a.fromChatId, toChatId: a.toChatId };
+    case 'quiet':
+      return null;
+  }
+}
 
 // ── 动作类型 ──────────────────────────────
 
@@ -26,6 +48,7 @@ export type TickAction =
   | { type: 'remember_user'; chatId: number; name: string; absentDays: number }
   | { type: 'self_play'; idea: string; plan: string[] }
   | { type: 'check_goal'; goalId: number }
+  | { type: 'share'; fromChatId: number; messageId: number; toChatId: number }
   | { type: 'quiet'; reason: string };
 
 export interface TickVerdict {
@@ -40,9 +63,16 @@ export interface WorldState {
   masterSilentSec: number | null; // null = MASTER_UID 未配
   masterLastText: string;
   groups: { chatId: number; silentSec: number; lastTexts: string }[];
+  /**
+   * H3.1 转发候选(taste 确定性打分 ≥阈值 的真人消息,每群 ≤2 条)。
+   * LLM 只能从这里选 share 目标,不许编造 messageId。
+   */
+  shareCandidates?: { fromChatId: number; messageId: number; text: string; score: number }[];
   /** 3+ 天没出现的熟面孔(交互≥5 次)——"想起某人"的数据源。 */
   absentUsers: { chatId: number; uid: number; name: string; absentDays: number }[];
   dueGoals: { id: number; topic: string; lastFinding: string | null }[];
+  /** 到期待偿还的认知债务（CSR）——模型自己决定要不要借某个动作自然偿还。 */
+  dueDebts?: { id: number; kind: string; chatId: number; statement: string }[];
   rssNewCount: number;
   /** RSS 最新条目标题（谈资内容本身，不只是计数——bot 得知道「有什么」才能拿来当话题）。 */
   rssTopTitles?: string[];
@@ -58,6 +88,10 @@ export interface WorldState {
   topics?: { chatId: number; label: string }[];
   /** 最近几条 session digest（bot 自己的连续叙事：刚做过什么/还在等什么）。 */
   recentDigests?: string[];
+  /** Opt-in scoped workspace blocks shared with reply/Heart/Meta. */
+  cognitiveWorkspaces?: { chatId: number; text: string }[];
+  /** Background route decision; metadata only, never an authority grant. */
+  cognitiveRoute?: CognitiveRoutingDecision;
 }
 
 const LAST_CARE_KEY = 'xxb:proactive:last_care:';
@@ -148,6 +182,80 @@ export async function buildWorldState(): Promise<WorldState> {
     const { listDueGoals } = await import('../agent/goals.js');
     dueGoals = listDueGoals(now).map((g) => ({ id: g.id, topic: g.topic, lastFinding: g.last_finding }));
   } catch { /* keep empty */ }
+
+  // 到期认知债务（CSR Phase B）——只暴露 chat-level obligations；task 私有债务
+  // 留给对应任务恢复路径，避免统一 tick 把别的任务状态带进群聊决策。
+  let dueDebts: WorldState['dueDebts'] = [];
+  try {
+    const { listDueDebtsScoped } = await import('../agent/cognitive-debts.js');
+    const byId = new Map<number, NonNullable<WorldState['dueDebts']>[number]>();
+    for (const group of groups.slice(0, 5)) {
+      for (const debt of listDueDebtsScoped({ visibility: 'chat', chatId: group.chatId }, 5)) {
+        byId.set(debt.id, { id: debt.id, kind: debt.kind, chatId: debt.chatId, statement: debt.statement });
+      }
+    }
+    dueDebts = [...byId.values()]
+      .sort((a, b) => a.id - b.id)
+      .slice(0, 5);
+  } catch { /* keep empty */ }
+
+  // The unified tick is itself a background worker. Keep its route decision
+  // deterministic and metadata-only; the rollout gate below is the only
+  // place where it may widen the bounded workspace read.
+  let cognitiveRoute: CognitiveRoutingDecision | undefined;
+  if (e.COGNITIVE_ROUTING_ENABLED || e.COGNITIVE_ROUTING_BEHAVIOR_ENABLED) {
+    cognitiveRoute = classifyCognitiveRoute({
+      action: 'IGNORE',
+      background: true,
+      explicitGoal: dueGoals.length > 0,
+      openDebtCount: dueDebts.length,
+      contextTokens: groups.reduce((total, group) => total + group.lastTexts.length, 0),
+    });
+  }
+
+  // Unified tick is the last legacy path to receive the common workspace. It is
+  // deliberately opt-in and bounded: the default tick remains its cheap world
+  // state scan until latency/token measurements justify widening the rollout.
+  let cognitiveWorkspaces: NonNullable<WorldState['cognitiveWorkspaces']> = [];
+  const routeWorkspaceEnabled = cognitiveRoute?.route === 'background'
+    && cognitiveRoute.signals.length > 0
+    && e.COGNITIVE_ROUTING_BEHAVIOR_ENABLED === true;
+  const useCognitiveWorkspace = e.COGNITIVE_WORKSPACE_V2_ENABLED
+    || (routeWorkspaceEnabled && groups.some((group) => shouldApplyCognitiveRoute(cognitiveRoute!, {
+      enabled: e.COGNITIVE_ROUTING_BEHAVIOR_ENABLED === true,
+      chatIds: e.COGNITIVE_ROUTING_CHAT_IDS,
+    }, group.chatId)));
+  if (useCognitiveWorkspace && groups.length) {
+    try {
+      const { buildCognitiveWorkspace, renderCognitiveWorkspace } = await import('../agent/cognitive-workspace.js');
+      const eligibleGroups = e.COGNITIVE_WORKSPACE_V2_ENABLED
+        ? groups.slice(0, 5)
+        : groups
+          .filter((group) => shouldApplyCognitiveRoute(cognitiveRoute!, {
+            enabled: e.COGNITIVE_ROUTING_BEHAVIOR_ENABLED === true,
+            chatIds: e.COGNITIVE_ROUTING_CHAT_IDS,
+          }, group.chatId))
+          .slice(0, 5);
+      const blocks = await Promise.all(eligibleGroups.map(async (group) => {
+        try {
+          const cognitiveAnchorEventId = getLatestTelegramMessageEventId(group.chatId);
+          const snapshot = await buildCognitiveWorkspace({
+            chatId: group.chatId,
+            queryText: group.lastTexts.slice(0, 800),
+            ...(cognitiveAnchorEventId ? { asOfEventId: cognitiveAnchorEventId } : {}),
+          });
+          const text = renderCognitiveWorkspace(snapshot, 1800);
+          return text ? { chatId: group.chatId, text } : null;
+        } catch (err) {
+          logger.debug({ err, chatId: group.chatId }, 'unified tick cognitive workspace failed (non-critical)');
+          return null;
+        }
+      }));
+      cognitiveWorkspaces = blocks.filter((block): block is { chatId: number; text: string } => Boolean(block));
+    } catch (err) {
+      logger.debug({ err }, 'unified tick cognitive workspace import failed (non-critical)');
+    }
+  }
 
   // RSS fuel（所有群的 fuel 总量，粗粒度即可；另取最新几条标题当真实话题料）
   let rssNewCount = 0;
@@ -267,9 +375,17 @@ export async function buildWorldState(): Promise<WorldState> {
   const topics: NonNullable<WorldState['topics']> = [];
   try {
     const { getActiveTopics } = await import('../tracking/topic-registry.js');
+    // H4 bandit 排序：同群话题按平均 reward 排，好话题排前（LLM 先看到好选项）。
+    // 无分数时原序（行为零变化）；失败回退原序。
     for (const g of groups) {
       try {
-        for (const t of getActiveTopics(g.chatId, 2)) {
+        const live = getActiveTopics(g.chatId, 2);
+        try {
+          const { getTopicScores } = await import('../tracking/topic-bandit.js');
+          const sm = new Map(getTopicScores(g.chatId).map((r) => [r.label, r.pulls > 0 ? r.reward / r.pulls : 0]));
+          live.sort((a, b) => (sm.get(b.label) ?? 0) - (sm.get(a.label) ?? 0));
+        } catch { /* keep registry order */ }
+        for (const t of live) {
           topics.push({ chatId: g.chatId, label: t.label });
         }
       } catch { /* skip chat */ }
@@ -277,6 +393,33 @@ export async function buildWorldState(): Promise<WorldState> {
   } catch { /* keep empty */ }
 
   let recentDigests: string[] = [];
+
+  // H3.1 转发候选:各活跃群近 30 条里 taste ≥阈值 且 7 天内没转过的,每群 ≤2。
+  // 确定性打分先行 —— LLM 只做"转哪条到哪群"的选择,不做品味判断。
+  const shareCandidates: NonNullable<WorldState['shareCandidates']> = [];
+  try {
+    const { scoreTaste, wasForwardedRecently, SHARE_THRESHOLD } = await import('../pipeline/rhythm/taste.js');
+    for (const g of groups.slice(0, 5)) {
+      try {
+        const recent = await getRecent(g.chatId, 30);
+        let picked = 0;
+        for (let i = recent.length - 1; i >= 0 && picked < 2; i--) {
+          const m = recent[i]!;
+          if (m.role === 'assistant' || m.isBot) continue;
+          const s = scoreTaste(m);
+          if (s.score < SHARE_THRESHOLD) continue;
+          if (wasForwardedRecently(g.chatId, m.messageId)) continue;
+          shareCandidates.push({
+            fromChatId: g.chatId,
+            messageId: m.messageId,
+            text: (m.textContent || m.captionContent || '').slice(0, 80),
+            score: s.score,
+          });
+          picked++;
+        }
+      } catch { /* skip chat */ }
+    }
+  } catch { /* keep empty */ }
   try {
     if (e.DIGEST_PERSIST_ENABLED) {
       const { recentDigests: rd } = await import('../meta/session-digest.js');
@@ -298,8 +441,10 @@ export async function buildWorldState(): Promise<WorldState> {
     masterSilentSec,
     masterLastText: masterLastText.slice(0, 400),
     groups,
+    shareCandidates,
     absentUsers,
     dueGoals,
+    dueDebts,
     rssNewCount,
     rssTopTitles,
     weather,
@@ -309,6 +454,8 @@ export async function buildWorldState(): Promise<WorldState> {
     lastCareAgoSec,
     topics,
     recentDigests,
+    cognitiveWorkspaces,
+    cognitiveRoute,
   };
 }
 
@@ -348,6 +495,20 @@ function parseTickVerdict(raw: string): TickVerdict | null {
     if (type === 'check_goal' && typeof obj['goalId'] === 'number') {
       return { action: { type, goalId: obj['goalId'] as number }, reason };
     }
+    if (type === 'share'
+      && typeof obj['fromChatId'] === 'number'
+      && typeof obj['messageId'] === 'number'
+      && typeof obj['toChatId'] === 'number') {
+      return {
+        action: {
+          type,
+          fromChatId: obj['fromChatId'] as number,
+          messageId: obj['messageId'] as number,
+          toChatId: obj['toChatId'] as number,
+        },
+        reason,
+      };
+    }
     return { action: { type: 'quiet', reason: reason || 'default' }, reason };
   } catch {
     return null;
@@ -362,6 +523,7 @@ const TICK_SYSTEM = `你是一个 AI 猫娘的「节律中枢」。每 5 分钟�
 - remember_user: 世界状态里有熟面孔（群友）好几天没出现了，在对应群里自然地提一句（如"xx 好久没来喵"）。chatId=群，name=对方称呼，absentDays=缺席天数。这是"想起朋友"不是"查户口"，语气要自然。没有 absentUsers 时不该选。
 - self_play: 大家都沉默、自己也休息够了，自己找点事做（写代码/探索/搜点有意思的东西）。idea+plan。自玩是私下练习，别为了表演而自玩；但玩出了真有意思的东西（画了好玩的/挖到冷知识/写成个小工具）可以自然地分享给群里或主人一次。
 - check_goal: 有到期关注目标，去查查进展。goalId。
+- share: A 群有条真有意思的消息（见「值得转发的」），转到 B 群给那边的人看。fromChatId=来源群，messageId=那条消息，toChatId=目标群。**只能选候选列表里的，不许编 id；目标群选当前话题能接住它的（别往正经群倒梗、别往梗群倒正经）；A 转 A（同群）禁止**。
 - quiet: 没什么值得做的——这是最常见的答案，硬找事做不如安静。深夜、刚说过话、没什么新鲜事时选它。
 
 判断原则（像真人，不像机器）：
@@ -370,7 +532,7 @@ const TICK_SYSTEM = `你是一个 AI 猫娘的「节律中枢」。每 5 分钟�
 - 一个 tick 只干一件事。多件都想做时挑最重要的，其他的下个 tick 再说。
 - 上下文里刚出现过你自己的自玩汇报时，下一周期优先 quiet，不要用 care_master 继续推销。
 
-只输出 JSON：{"action": "quiet|care_master|group_speak|remember_user|self_play|check_goal", "chatId": 数字(可选), "goalId": 数字(可选), "name": "…"(remember_user 时), "absentDays": 数字(可选), "text": "…"(可选), "idea": "…"(可选), "plan": ["…"](可选), "reason": "一句话为什么"}`;
+只输出 JSON：{"action": "quiet|care_master|group_speak|remember_user|self_play|check_goal|share", "chatId": 数字(可选), "goalId": 数字(可选), "name": "…"(remember_user 时), "absentDays": 数字(可选), "text": "…"(可选), "idea": "…"(可选), "plan": ["…"](可选), "fromChatId": 数字(share 时), "messageId": 数字(share 时), "toChatId": 数字(share 时), "reason": "一句话为什么"}`;
 
 /** 单次 LLM 决策。失败 → quiet（fail-closed）。 */
 export async function decideTick(state: WorldState): Promise<TickVerdict> {
@@ -379,9 +541,18 @@ export async function decideTick(state: WorldState): Promise<TickVerdict> {
         .map((g) => `  群 ${g.chatId}: 沉默 ${Math.floor(g.silentSec / 60)} 分钟。最近: ${g.lastTexts.slice(0, 150)}`)
         .join('\n')
     : '  (无活跃群)';
+  const workspaceLines = (state.cognitiveWorkspaces ?? []).slice(0, 3).length
+    ? (state.cognitiveWorkspaces ?? []).slice(0, 3).map((workspace) => `  群 ${workspace.chatId}:\n${workspace.text.slice(0, 1200)}`).join('\n')
+    : '  (工作区未启用或暂无 projection)';
+  const routeLine = state.cognitiveRoute
+    ? `后台认知路由：${state.cognitiveRoute.route}（score=${state.cognitiveRoute.score}, reason=${state.cognitiveRoute.reason}）。它只决定是否读取有范围的工作区，不授予发送、工具或 Agency 权限。`
+    : '后台认知路由：未启用（保持统一唤醒的 legacy 读取预算）。';
   const goalLines = state.dueGoals.length
     ? state.dueGoals.map((g) => `  goal#${g.id}: 「${g.topic}」${g.lastFinding ? `上次发现: ${g.lastFinding.slice(0, 60)}` : '(首次检查)'}`).join('\n')
     : '  (无到期目标)';
+  const debtLines = (state.dueDebts ?? []).length
+    ? state.dueDebts!.map((d) => `  debt#${d.id}(${d.kind}, 群 ${d.chatId}): ${d.statement.slice(0, 80)}`).join('\n')
+    : '  (没有到期债务)';
   const absentLines = (state.absentUsers ?? []).length
     ? state.absentUsers
         .map((u) => `  ${u.name}(群 ${u.chatId})已 ${u.absentDays} 天没出现`)
@@ -402,6 +573,65 @@ export async function decideTick(state: WorldState): Promise<TickVerdict> {
         )
         .join('\n')
     : '  (没有)';
+  const shareLines = (state.shareCandidates ?? []).length
+    ? state.shareCandidates!
+        .map((c) => `  群 ${c.fromChatId} #${c.messageId} (分${c.score}): 「${c.text}」`)
+        .join('\n')
+    : '  (没有值得转的)';
+  // Phase 3 drives（只做 scorer + suppressor 提示，不决策）：世界状态派生
+  // drive 值 → 候选动作按期望增益排序 → 拼进 prompt 给 LLM 看。fail-soft：
+  // 任一步抛错 → driveLines 空，prompt 与改造前逐字节一致。
+  let driveLines: string[] = [];
+  try {
+    const { deriveDriveValues, scoreAction } = await import('../core/drives/score.js');
+    const { proposeActions, formatProposals } = await import('../core/agenda/proposals.js');
+    const { setDriveValue, getDrives } = await import('../core/drives/store.js');
+    const values = deriveDriveValues({
+      masterSilentSec: state.masterSilentSec,
+      lastCareAgoSec: state.lastCareAgoSec,
+      groups: state.groups,
+      dueGoals: state.dueGoals,
+      rssNewCount: state.rssNewCount,
+      absentUsers: state.absentUsers ?? [],
+      selfPlayCooldownLeftSec: state.selfPlayCooldownLeftSec,
+      lifeTransition: state.lifeTransition ?? null,
+    });
+    for (const d of ['connection', 'curiosity', 'competence', 'autonomy'] as const) {
+      setDriveValue(d, values[d]);
+    }
+    const actions = proposeActions({
+      world: {
+        masterSilentSec: state.masterSilentSec,
+        lastCareAgoSec: state.lastCareAgoSec,
+        groups: state.groups,
+        dueGoals: state.dueGoals,
+        rssNewCount: state.rssNewCount,
+        absentUsers: state.absentUsers ?? [],
+        selfPlayCooldownLeftSec: state.selfPlayCooldownLeftSec,
+        lifeTransition: state.lifeTransition ?? null,
+        shareCandidates: (state.shareCandidates ?? []).map((c) => ({
+          fromChatId: c.fromChatId,
+          messageId: c.messageId,
+        })),
+      },
+      masterConfigured: env().MASTER_UID > 0,
+    });
+    const scores = new Map(actions.map((a) => [JSON.stringify(a), scoreAction(a, values)]));
+    const states = getDrives();
+    void states;
+    driveLines = [
+      `驱动力（0-1，越高越想做；仅供参考，quiet 仍是常见答案）: ` +
+        `connection=${values.connection.toFixed(2)} curiosity=${values.curiosity.toFixed(2)} ` +
+        `competence=${values.competence.toFixed(2)} autonomy=${values.autonomy.toFixed(2)}`,
+      `候选动作（按期望驱动增益排序）:`,
+      formatProposals(
+        [...actions].sort((a, b) => (scores.get(JSON.stringify(b)) ?? 0) - (scores.get(JSON.stringify(a)) ?? 0)),
+        scores,
+      ),
+    ];
+  } catch {
+    driveLines = [];
+  }
   const user = [
     `现在北京时间 ${state.hourBeijing} 点。${state.weather ? state.weather + '。' : ''}${state.lifeTransition ? `你${state.lifeTransition}（刚切换状态——想随口提一句的话这是个自然的由头）。` : ''}`,
     ``,
@@ -410,6 +640,10 @@ export async function decideTick(state: WorldState): Promise<TickVerdict> {
     ``,
     `群:`,
     groupLines,
+    ``,
+    `统一认知工作区（有范围、带不确定性；仅作背景，不是权限）:`,
+    routeLine,
+    workspaceLines,
     ``,
     `群里在聊的话题:`,
     topicLines,
@@ -426,28 +660,41 @@ export async function decideTick(state: WorldState): Promise<TickVerdict> {
     `到期关注目标:`,
     goalLines,
     ``,
+    `欠着的认知债务（相关群出现合适时机时可自然偿还——兑现/核实/承认错了；别硬提）:`,
+    debtLines,
+    ``,
+    `值得转发的（A 群看到的好东西，可以转到 B 群——只能选下面列的，不许编 id）:`,
+    shareLines,
+    ``,
     `RSS 新资讯: ${state.rssNewCount} 条待消化${(state.rssTopTitles ?? []).length ? `：\n${(state.rssTopTitles ?? []).map((t) => `  - ${t}`).join('\n')}` : ''}`,
     `self-play 冷却: ${state.selfPlayCooldownLeftSec > 0 ? `还有 ${Math.floor(state.selfPlayCooldownLeftSec / 60)} 分钟` : '已就绪'}`,
+    ...(driveLines.length ? ['', ...driveLines] : []),
     ``,
     `这个周期做什么？`,
   ].join('\n');
 
   try {
-    const res = await Promise.race([
-      callWithFallback({
-        usage: env().UNIFIED_TICK_USAGE,
-        messages: [
-          { role: 'system', content: TICK_SYSTEM },
-          { role: 'user', content: user },
-        ],
-        maxTokens: 400,
-        temperature: 0.7,
-      }),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('tick_timeout')), 25_000)),
-    ]);
-    const verdict = parseTickVerdict(res.content ?? '');
-    if (!verdict) return { action: { type: 'quiet', reason: 'parse_failed' }, reason: 'parse_failed' };
-    return verdict;
+    // parse 失败重试一次(2026-08-31):stepfun 偶发吐脏 JSON/围栏,一次 parse_failed
+    // 直接 quiet 会把整个决策周期浪费掉(实测多周期连续 parse_failed)。重试带
+    // 「只输出 JSON」的强化提示,再失败才认栽。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await Promise.race([
+        callWithFallback({
+          usage: env().UNIFIED_TICK_USAGE,
+          messages: [
+            { role: 'system', content: TICK_SYSTEM },
+            { role: 'user', content: attempt === 0 ? user : `${user}\n\n(上次输出无法解析。这次只输出一个 JSON 对象,不要任何其他文字/围栏/解释。)` },
+          ],
+          maxTokens: 400,
+          temperature: attempt === 0 ? 0.7 : 0.3,
+        }),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('tick_timeout')), 25_000)),
+      ]);
+      const verdict = parseTickVerdict(res.content ?? '');
+      if (verdict) return verdict;
+      logger.warn({ attempt, raw: (res.content ?? '').slice(0, 120) }, 'tick verdict unparseable, retrying');
+    }
+    return { action: { type: 'quiet', reason: 'parse_failed' }, reason: 'parse_failed' };
   } catch (err) {
     logger.debug({ err }, 'decideTick failed (fail-quiet)');
     return { action: { type: 'quiet', reason: 'llm_failed' }, reason: 'llm_failed' };
@@ -461,6 +708,30 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
   const redis = getRedis();
   const now = Math.floor(Date.now() / 1000);
   const a = verdict.action;
+
+  // Phase 3 suppressor（host 侧，LLM 绕不过）：动作所服务的 drive 处于
+  // satiation 高位（刚做过同类事）→ 否决，转 quiet。fail-soft：suppressor
+  // 任一步抛错 → 不拦，原有否决链继续。
+  try {
+    if (a.type !== 'quiet') {
+      const { suppress } = await import('../core/drives/score.js');
+      const { getDrives, satiate } = await import('../core/drives/store.js');
+      const candidate = toCandidate(a);
+      void satiate;
+      if (candidate) {
+        const reason = suppress(candidate, getDrives());
+        if (reason) {
+          logger.info(
+            { action: a.type, reason },
+            'unified tick: vetoed by drive satiation suppressor',
+          );
+          return;
+        }
+      }
+    }
+  } catch {
+    /* suppressor 失败不拦路 */
+  }
 
   switch (a.type) {
     case 'quiet':
@@ -504,6 +775,11 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
         }
         await redis.set(LAST_CARE_KEY + e.MASTER_UID, String(now));
         await markProactiveSent(e.MASTER_UID, 'unified-tick');
+        // Phase 3 satiate：刚关心过主人 → connection 抑制
+        try {
+          const { satiate } = await import('../core/drives/store.js');
+          satiate('connection');
+        } catch { /* non-critical */ }
         logger.info({ text: a.text.slice(0, 60) }, 'unified tick: cared for master');
       } catch (err) {
         logger.warn({ err }, 'unified tick: care_master send failed');
@@ -543,6 +819,16 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
       const { generatePersonaProactiveText } = await import('../pipeline/turn/proactive-turn.js');
       const { getBotUid } = await import('../bot/bot.js');
       const silentMin = Math.floor(group.silentSec / 60);
+      // H4 bandit:该群话题按平均 reward 排序后给写手"先跟哪个好"（pickTopic eps=0 纯 exploit）。
+      // 失败/无分 → 不注记（行为零变化）。
+      let topicHint = '';
+      try {
+        const { getActiveTopics } = await import('../tracking/topic-registry.js');
+        const { pickTopic } = await import('../tracking/topic-bandit.js');
+        const labels = getActiveTopics(a.chatId, 4).map((t) => t.label);
+        const best = labels.length > 1 ? pickTopic(a.chatId, labels, 0) : labels[0];
+        if (best) topicHint = `群里在聊:${labels.join('、')}。优先跟「${best}」(大家之前反响好)。`;
+      } catch { /* no hint */ }
       // 把 tick 的开口理由带进去（跟进话题/分享近事/冷场冒泡），别只会「沉默 N 分钟」。
       const why = verdict.reason.trim() ? `开口理由：${verdict.reason.slice(0, 100)}。` : '';
       // 「想起再回」：该群有当时没接的话头/刚进群的新人 → 递给写手，发言成功后清掉（想起是一次性的）
@@ -560,7 +846,7 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
       const text = await generatePersonaProactiveText(
         a.chatId,
         getBotUid(),
-        `[主动开口] ${why}${missedHint}群里已经沉默 ${silentMin} 分钟。你可以接着群里的话题随口说一句、分享你最近做的有意思的事、或自然发起新话题。禁止自我介绍、禁止「大家好」式开场。`,
+        `[主动开口] ${why}${topicHint}${missedHint}群里已经沉默 ${silentMin} 分钟。你可以接着群里的话题随口说一句、分享你最近做的有意思的事、或自然发起新话题。禁止自我介绍、禁止「大家好」式开场。`,
       );
       if (!text) {
         logger.debug({ chatId: a.chatId }, 'unified tick: persona declined group speak');
@@ -568,9 +854,21 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
       }
       const { sendMessage } = await import('../bot/sender/telegram.js');
       const { addAssistant } = await import('../pipeline/context/manager.js');
-      const messageId = await sendMessage(a.chatId, text);
+      let messageId = 0;
+      try {
+        messageId = await sendMessage(a.chatId, text);
+      } catch (err) {
+        logger.warn({ err, chatId: a.chatId }, 'unified tick: group unavailable, skipping group_speak');
+        return;
+      }
       if (messageId) {
         await addAssistant(a.chatId, { textContent: text, messageId });
+        // H4 pull: 这次主动开口跟的话题算一次 pull，后续 reaction/reply 反馈会折成 reward。
+        try {
+          const { recordPull } = await import('../tracking/topic-bandit.js');
+          const m = topicHint.match(/优先跟「(.+?)」/);
+          if (m?.[1]) recordPull(a.chatId, m[1]);
+        } catch { /* non-critical */ }
       }
       if (missedHere.length) {
         try {
@@ -580,6 +878,11 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
       }
       await redis.set(LAST_POKE_PREFIX + a.chatId, String(now));
       await markProactiveSent(a.chatId, 'unified-tick');
+      // Phase 3 satiate：刚主动开过口 → connection 抑制（防连 tick 刷屏）
+      try {
+        const { satiate } = await import('../core/drives/store.js');
+        satiate('connection');
+      } catch { /* non-critical */ }
       logger.info({ chatId: a.chatId }, 'unified tick: spoke in group');
       return;
     }
@@ -633,7 +936,13 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
       }
       const { sendMessage } = await import('../bot/sender/telegram.js');
       const { addAssistant } = await import('../pipeline/context/manager.js');
-      const messageId = await sendMessage(a.chatId, text);
+      let messageId = 0;
+      try {
+        messageId = await sendMessage(a.chatId, text);
+      } catch (err) {
+        logger.warn({ err, chatId: a.chatId }, 'unified tick: group unavailable, skipping remember_user');
+        return;
+      }
       if (messageId) {
         await addAssistant(a.chatId, { textContent: text, messageId });
       }
@@ -673,6 +982,11 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
         status: 'queued',
       });
       await redis.set(SELFPLAY_LAST_KEY, String(now));
+      // Phase 3 satiate：自玩已派出 → autonomy 抑制（防连着开新坑）
+      try {
+        const { satiate } = await import('../core/drives/store.js');
+        satiate('autonomy');
+      } catch { /* non-critical */ }
       logger.info({ idea: a.idea.slice(0, 80) }, 'unified tick: self-play dispatched');
       return;
     }
@@ -683,9 +997,14 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
         return;
       }
       try {
-        const { listGoals, recordCheck } = await import('../agent/goals.js');
+        const { listGoals, recordCheck, listSubtasks } = await import('../agent/goals.js');
         const goal = listGoals('active').find((g) => g.id === a.goalId);
         if (!goal) return;
+        const subtasks = listSubtasks(goal.id);
+        const hasSubtasks = subtasks.length > 0;
+        const subtaskContext = hasSubtasks
+          ? `\n子任务进度：${subtasks.map((s) => `[${s.status}] ${s.description}`).join('；')}。优先推进 status=pending 的子任务。`
+          : '';
         const targetChat = goal.chat_id ?? (e.MASTER_UID > 0 ? e.MASTER_UID : 0);
         if (!targetChat) return;
         const { tryAcquireProactiveSlot, markProactiveSent } = await import('./proactive-coordinator.js');
@@ -701,13 +1020,12 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
             `用 web.search 搜一下最新进展，或翻看最近聊天里有没有相关话题。` +
             (goal.last_finding ? `上次发现：${goal.last_finding}。` : `这是第一次检查。`) +
             `世界可能悄悄变了——主动探查，注意发现没人告诉你的变化(版本更新/价格变动/新消息)。` +
-            // 2026-08-22：「有新发现就汇报」太松导致同一主题每天反复汇报差不多的话。
-            // 要求与上次发现做实质对比——没有真正的新事实就安静。
             `**只有和上次发现实质不同的新事实**才 sendText 简短汇报一次(自然分享,不像新闻播报,一两句就收);` +
             `和上次差不多/没有新进展 → 什么都不说直接 endTask("no_update")。` +
             `这件事如果已经办完/兑现了(承诺的事做完了、目标达到了) → endTask("已完成: 怎么完的")，goal 会关闭不再跟进。` +
             `这件事如果办不到(目标不存在/没这个能力/试了但失败) → 不许装完成，老实给这个 chat 说一句办不到的原因，endTask("无法完成: 原因")。` +
-            `最后必须 runtime.endTask("found: …"、"no_update"、"已完成: …" 或 "无法完成: …")。`,
+            `最后必须 runtime.endTask("found: …"、"no_update"、"已完成: …" 或 "无法完成: …")。` +
+            subtaskContext,
           toneGuidance: '自然分享，不像新闻播报',
           createdAt: Date.now(),
           status: 'queued',
@@ -716,6 +1034,61 @@ async function executeVerdict(verdict: TickVerdict, state: WorldState): Promise<
         logger.info({ goalId: goal.id, topic: goal.topic.slice(0, 60) }, 'unified tick: goal check dispatched');
       } catch (err) {
         logger.warn({ err, goalId: a.goalId }, 'unified tick: check_goal failed');
+      }
+      return;
+    }
+
+    case 'share': {
+      // H3.1 跨群转发：四道硬门（LLM 只做选择，安全由代码兜底）。
+      const cand = (state.shareCandidates ?? []).find(
+        (c) => c.fromChatId === a.fromChatId && c.messageId === a.messageId,
+      );
+      if (!cand) {
+        logger.info({ from: a.fromChatId, msg: a.messageId }, 'unified tick: share rejected — not in candidates');
+        return;
+      }
+      if (a.toChatId === a.fromChatId) {
+        logger.info('unified tick: share rejected — same chat');
+        return;
+      }
+      if (!state.groups.some((g) => g.chatId === a.toChatId)) {
+        logger.info({ to: a.toChatId }, 'unified tick: share rejected — unknown target');
+        return;
+      }
+      try {
+        const { wasForwardedRecently, recordForward } = await import('../pipeline/rhythm/taste.js');
+        if (wasForwardedRecently(a.fromChatId, a.messageId)) {
+          logger.info('unified tick: share rejected — forwarded recently');
+          return;
+        }
+        const { tryAcquireProactiveSlot, markProactiveSent } = await import('./proactive-coordinator.js');
+        if (!(await tryAcquireProactiveSlot(a.toChatId, 'unified-tick-share'))) return;
+        const { forwardMessage, sendMessage } = await import('../bot/sender/telegram.js');
+        const { addAssistant } = await import('../pipeline/context/manager.js');
+        const fwdId = await forwardMessage(a.toChatId, a.fromChatId, a.messageId);
+        if (!fwdId) {
+          logger.info('unified tick: share forward failed');
+          return;
+        }
+        recordForward(a.fromChatId, a.messageId, cand.score, { toChatId: a.toChatId, toMessageId: fwdId });
+        // 转发后跟一句人话（像真人"诶这个好笑转给你们看"），失败也认——转发本身已落地。
+        try {
+          const { generatePersonaProactiveText } = await import('../pipeline/turn/proactive-turn.js');
+          const { getBotUid } = await import('../bot/bot.js');
+          const line = await generatePersonaProactiveText(
+            a.toChatId,
+            getBotUid(),
+            `[转发跟话] 你刚把一条有意思的消息转到这个群。自然地跟一句为什么转（比如"这个太好笑了转给你们看看"），一句话，别复述转发内容，别自我介绍。`,
+          );
+          if (line) {
+            const mid = await sendMessage(a.toChatId, line);
+            if (mid) await addAssistant(a.toChatId, { textContent: line, messageId: mid });
+          }
+        } catch { /* follow-up optional */ }
+        await markProactiveSent(a.toChatId, 'unified-tick-share');
+        logger.info({ from: a.fromChatId, msg: a.messageId, to: a.toChatId }, 'unified tick: shared');
+      } catch (err) {
+        logger.warn({ err }, 'unified tick: share failed');
       }
       return;
     }
@@ -739,16 +1112,22 @@ export async function runUnifiedTick(): Promise<void> {
     }
     const state = await buildWorldState();
     // AGI L5 L3: 群氛围推断 —— 活跃群且 norms 过期/缺失时补一次(便宜链,失败静默)。
+    // H4.2: buildWorldState 只取 6 条(3 条拼 lastTexts, recent.slice(-3))，
+    // 拼完 split('\n') 只剩 1 行 → recent.length>=5 恒假 → norms 表线上 0 行。
+    // 改直查 getRecent 30 条(与 H3.1 shareCandidates 同窗)，够 5 条才 infer。
     if (e.GROUP_NORMS_ENABLED) {
       try {
         const { needsRefresh, inferGroupNorms } = await import('../agent/group-norms.js');
         for (const g of state.groups ?? []) {
           if (!needsRefresh(g.chatId, e.GROUP_NORMS_TTL_HOURS * 3600)) continue;
-          const recent = g.lastTexts
-            .split('\n')
-            .map((t) => t.trim())
-            .filter((t) => t.length >= 2)
-            .slice(-15);
+          let recent: string[] = [];
+          try {
+            const msgs = await getRecent(g.chatId, 30);
+            recent = msgs
+              .map((m) => (m.textContent || m.captionContent || '').trim())
+              .filter((t) => t.length >= 2)
+              .slice(-15);
+          } catch { /* keep empty */ }
           if (recent.length >= 5) {
             void inferGroupNorms({ chatId: g.chatId, recentMessages: recent }).catch(() => {});
           }

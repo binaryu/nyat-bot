@@ -32,6 +32,7 @@ const baseTask = {
   status: 'done' as const,
   totalTurns: 8,
   segment: 0,
+  assessment: { status: 'verified', reasons: ['caller_checks_passed'], checks: [] },
 };
 
 beforeEach(() => {
@@ -39,6 +40,7 @@ beforeEach(() => {
   db.exec(readFileSync(join(__dirname, '../../../migrations/0054_episodes_experience.sql'), 'utf8'));
   db.exec(readFileSync(join(__dirname, '../../../migrations/0057_experience_verify.sql'), 'utf8'));
   db.exec(readFileSync(join(__dirname, '../../../migrations/0061_experience_share.sql'), 'utf8'));
+  db.exec(readFileSync(join(__dirname, '../../../migrations/0075_experience_source.sql'), 'utf8'));
   callWithFallbackMock.mockReset();
 });
 
@@ -95,6 +97,53 @@ describe('parseDistillOutput', () => {
     expect(withGoal.followUpGoal).toBe('主人的 Sub2API 项目进展');
     const tooShort = parseDistillOutput(JSON.stringify({ summary: 's', follow_up_goal: 'ab' }))!;
     expect(tooShort.followUpGoal).toBeNull();
+  });
+});
+
+describe('distillEpisode evidence gate', () => {
+  it('maps unverified lifecycle-done to failed episode outcome', async () => {
+    callWithFallbackMock.mockResolvedValue({ content: JSON.stringify({ summary: 's' }) });
+    const unverified = { ...baseTask, assessment: { status: 'unverified', reasons: ['no_contract'], checks: [] } };
+    await distillEpisode({ task: unverified, outcome: 'done', progressSummary: 's', tailText: 't' });
+    const ep = db.prepare('SELECT * FROM episodes WHERE task_id = ?').get('task-1') as Record<string, unknown>;
+    expect(ep['outcome']).toBe('failed');
+    const prompt = String(callWithFallbackMock.mock.calls[0]![0]['messages'][1]['content']);
+    expect(prompt).toContain('outcome: failed');
+  });
+
+  it('keeps verified done as done', async () => {
+    callWithFallbackMock.mockResolvedValue({ content: JSON.stringify({ summary: 's' }) });
+    await distillEpisode({ task: baseTask, outcome: 'done', progressSummary: 's', tailText: 't' });
+    const ep = db.prepare('SELECT * FROM episodes WHERE task_id = ?').get('task-1') as Record<string, unknown>;
+    expect(ep['outcome']).toBe('done');
+  });
+
+  it('P3-1: verified task stamps experience with verified lineage', async () => {
+    callWithFallbackMock.mockResolvedValue({
+      content: JSON.stringify({
+        summary: 's',
+        experience: [{ kind: 'trick', content: 'verified lineage content', tags: ['t'] }],
+      }),
+    });
+    await distillEpisode({ task: baseTask, outcome: 'done', progressSummary: 's', tailText: 't' });
+    const entries = db.prepare('SELECT * FROM experience_entries').all() as Record<string, unknown>[];
+    expect(entries.length).toBe(1);
+    expect(entries[0]!['source_assessment']).toBe('verified');
+    expect(entries[0]!['source_outcome']).toBe('done');
+  });
+
+  it('P3-1: unverified task stamps experience with unverified lineage', async () => {
+    callWithFallbackMock.mockResolvedValue({
+      content: JSON.stringify({
+        summary: 's',
+        experience: [{ kind: 'trick', content: 'unverified lineage content', tags: ['t'] }],
+      }),
+    });
+    const unverified = { ...baseTask, assessment: { status: 'unverified' as const, reasons: ['no_contract'], checks: [] } };
+    await distillEpisode({ task: unverified, outcome: 'done', progressSummary: 's', tailText: 't' });
+    const entries = db.prepare('SELECT * FROM experience_entries').all() as Record<string, unknown>[];
+    expect(entries.length).toBe(1);
+    expect(entries[0]!['source_assessment']).toBe('unverified');
   });
 });
 

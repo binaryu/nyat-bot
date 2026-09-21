@@ -233,6 +233,10 @@ export async function generateReply(
     /** Multi-Agent 预取的群往事(best-of-N 时复用,避免 recallEpisodes 的
      *  recall_count 被多稿各调一次而 ×N 失真)。提供时跳过内部 recallEpisodes。 */
     prefetchedEpisodes?: GroupEpisode[];
+    /** Opt-in route behavior: use the scoped workspace for a deep/background turn. */
+    useCognitiveWorkspace?: boolean;
+    /** Event id anchoring the workspace to the message's observed state. */
+    cognitiveAnchorEventId?: string;
   },
 ): Promise<{
   replies: ReplyOutput[];
@@ -240,6 +244,8 @@ export async function generateReply(
   toolExecutionFailed: boolean;
   /** G2: model-chosen emoji reactions to execute as first-class acts */
   reactions?: Array<{ targetMessageId: number; emoji: string }>;
+  /** H3: model-chosen poll to execute as first-class act (max 1 per turn) */
+  polls?: Array<{ question: string; options: string[]; targetMessageId: number }>;
   /** G2: the model deliberately chose silence — send nothing, not an error */
   modelSilent?: boolean;
 }> {
@@ -404,6 +410,27 @@ export async function generateReply(
         return roster;
       } catch (err) {
         logger.debug({ err, chatId }, 'Failed to fetch member roster (non-critical)');
+        return undefined;
+      }
+    })()
+    : Promise.resolve(undefined);
+
+  // Phase 2 rollout: legacy reply can opt into the same scoped workspace used
+  // by CodeAct. The promise starts alongside the existing rich-context reads;
+  // disabled means no import or database work on the ordinary fast path.
+  const cognitiveWorkspacePromise = (env().COGNITIVE_WORKSPACE_V2_ENABLED || callOpts?.useCognitiveWorkspace === true)
+    ? (async () => {
+      try {
+        const { buildCognitiveWorkspace, renderCognitiveWorkspace } = await import('../../agent/cognitive-workspace.js');
+        const snapshot = await buildCognitiveWorkspace({
+          chatId,
+          ...(!message.isAnonymous && !message.isBot ? { userId: message.uid } : {}),
+          queryText: (message.textContent || message.captionContent || '').slice(0, 800),
+          asOfEventId: callOpts?.cognitiveAnchorEventId,
+        });
+        return renderCognitiveWorkspace(snapshot);
+      } catch (err) {
+        logger.debug({ err, chatId }, 'legacy reply cognitive workspace failed (non-critical)');
         return undefined;
       }
     })()
@@ -745,8 +772,9 @@ export async function generateReply(
 
   // 中期记忆 pinned 块(flag off 时为 null,零开销)
   const midTermMemory = await getMidTermBlock(chatId).catch(() => null);
+  const cognitiveWorkspaceHint = await cognitiveWorkspacePromise;
 
-  const messages: ReplyMessage[] = buildMessages(
+  const buildMessageArgs = [
     systemPrompt,
     contextStr,
     message,
@@ -763,7 +791,12 @@ export async function generateReply(
     burstHint,
     expressionOverride,
     midTermMemory ?? undefined,
-  );
+  ] as const;
+  // Keep the legacy call arity stable while the workspace rollout is off. This
+  // matters for downstream wrappers that still mock the pre-workspace contract.
+  const messages: ReplyMessage[] = cognitiveWorkspaceHint
+    ? buildMessages(...buildMessageArgs, cognitiveWorkspaceHint)
+    : buildMessages(...buildMessageArgs);
 
   // P2 多模态直读(默认关):触发消息带图(或回复的是图)时,把原图直接喂给回复
   // 模型 —— 通用文本描述是"概述",丢细节;直读让模型自己看图回答"多少钱/哪个好/
@@ -957,6 +990,8 @@ export async function generateReply(
   const delegationMarkers = /(回复|回应|怼|评价|告诉|转告|提醒|帮我回|替我回|替我说|帮我和|代我)/;
   const userDelegated = delegationMarkers.test(message.textContent || '');
   let reactions: Array<{ targetMessageId: number; emoji: string }> | undefined;
+  // H3 poll:每回合最多 1 个 poll(与 react 同约束);最终草稿为准,regen 后旧 poll 不残留
+  let polls: Array<{ question: string; options: string[]; targetMessageId: number }> | undefined;
 
   const normalizeDraft = (raw: ReturnType<typeof parseReplyResponse>): ReturnType<typeof parseReplyResponse> => {
     let texts = raw;
@@ -965,6 +1000,11 @@ export async function generateReply(
       // 每回合最多 1 个 react;以**最终**草稿为准(regen 后旧 react 不残留)
       reactions = reactItems.length > 0
         ? reactItems.slice(0, 1).map((r) => ({ targetMessageId: r.targetMessageId, emoji: r.emoji! }))
+        : undefined;
+      // H3 poll 同约束:每回合最多 1 个;问题+选项 parser 已验,这里只收
+      const pollItems = raw.filter((r) => r.action === 'poll' && r.pollQuestion && (r.pollOptions?.length ?? 0) >= 2);
+      polls = pollItems.length > 0
+        ? pollItems.slice(0, 1).map((r) => ({ question: r.pollQuestion!, options: r.pollOptions!, targetMessageId: r.targetMessageId }))
         : undefined;
       texts = raw.filter((r) => r.action === undefined || r.action === 'reply' || r.action === 'sticker');
       for (const r of texts) {
@@ -1060,21 +1100,23 @@ export async function generateReply(
 
   if (needsSegment) {
     const primaryTargetId = parsedReplies[0]!.targetMessageId;
-    const { segments } = segmentReply(parsedReplies[0]!.replyContent, segmenterConfig);
+    if (env().REPLY_LONG_TEXT_SAFE_SPLIT_ENABLED) {
+      const { segments } = segmentReply(parsedReplies[0]!.replyContent, segmenterConfig);
 
-    if (segments.length > 1) {
-      const first = parsedReplies[0]!;
-      parsedReplies = segments.map((seg, idx) => ({
-        replyContent: seg,
-        targetMessageId: primaryTargetId,
-        // Only first segment gets quote-reply; the rest go without
-        replyQuote: idx === 0 ? first.replyQuote : false,
-        // P2:切段不丢字段 —— 犹豫挂第一段,贴纸意图挂最后一段(贴纸在文后发)
-        hesitateBefore: idx === 0 ? first.hesitateBefore : undefined,
-        stickerIntent: idx === segments.length - 1 ? first.stickerIntent : undefined,
-        modelStickerAct: idx === segments.length - 1 ? first.modelStickerAct : undefined,
-      }));
-      logger.debug({ count: segments.length }, 'Code segmenter split reply into multiple messages');
+      if (segments.length > 1) {
+        const first = parsedReplies[0]!;
+        parsedReplies = segments.map((seg, idx) => ({
+          replyContent: seg,
+          targetMessageId: primaryTargetId,
+          // Only first segment gets quote-reply; the rest go without
+          replyQuote: idx === 0 ? first.replyQuote : false,
+          // P2:切段不丢字段 —— 犹豫挂第一段,贴纸意图挂最后一段(贴纸在文后发)
+          hesitateBefore: idx === 0 ? first.hesitateBefore : undefined,
+          stickerIntent: idx === segments.length - 1 ? first.stickerIntent : undefined,
+          modelStickerAct: idx === segments.length - 1 ? first.modelStickerAct : undefined,
+        }));
+        logger.debug({ count: segments.length }, 'Code segmenter split reply into multiple messages');
+      }
     }
   }
 
@@ -1107,9 +1149,16 @@ export async function generateReply(
         const v = variantDraft.find((p) => !p.action && !isBlankReply(p.replyContent));
         if (v) {
           const ctxHint = `群聊回复,主题: ${(message.textContent || '').slice(0, 100)}`;
-          const { best, score } = await pickBestOfN([primary.replyContent, v.replyContent], ctxHint);
+          // Phase B: 同群近期群友态度进 verifier(同步 SQLite, <1ms)。无数据 bias=0,
+          // 加权后 ≈ 纯 LLM 分, 行为零变化; 有数据才上浮/下压。
+          let bias = 0;
+          try {
+            const { getChatFeedbackBias } = await import('../../tracking/feedback.js');
+            bias = getChatFeedbackBias(chatId);
+          } catch { /* non-critical: bias=0 */ }
+          const { best, score } = await pickBestOfN([primary.replyContent, v.replyContent], ctxHint, bias);
           if (best !== primary.replyContent && best === v.replyContent) {
-            logger.info({ chatId, score, primaryLen: primary.replyContent.length, variantLen: v.replyContent.length }, 'best-of-N picked variant over primary');
+            logger.info({ chatId, score, bias, primaryLen: primary.replyContent.length, variantLen: v.replyContent.length }, 'best-of-N picked variant over primary');
             primary.replyContent = v.replyContent;
           } else {
             logger.debug({ chatId, score }, 'best-of-N kept primary');
@@ -1152,6 +1201,7 @@ export async function generateReply(
     toolsUsed: result.toolsUsed,
     toolExecutionFailed,
     reactions,
+    polls,
     modelSilent,
   };
 }

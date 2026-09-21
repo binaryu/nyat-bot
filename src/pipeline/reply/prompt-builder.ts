@@ -23,8 +23,11 @@ import { getTopicLine } from '../../tracking/topic-registry.js';
 import { scratchPromptBlockSync } from '../../tracking/scratchpad.js';
 import { buildProfileInjection, getBotTagForAddressing } from '../../tracking/user-profile.js';
 import { buildAliasInjection } from '../../knowledge/person-aliases.js';
-import { buildSocialInjection } from '../../tracking/social-graph.js';
+import { buildSocialInjection, buildBridgeHint } from '../../tracking/social-graph.js';
 import { buildRoleHint } from '../../tracking/behavioral-roles.js';
+import { recallEpisodes } from '../../tracking/group-episodes.js';
+import { getExemplars } from '../../learners/dialect-exemplar.js';
+import { currentRiskLevel, buildValveHint } from '../../agent/reverse-valve.js';
 import { getBotUid } from '../../bot/bot.js';
 import { isMaster } from '../../admin/auth.js';
 import { formatBeijingNowLine } from '../../shared/beijing-time.js';
@@ -80,6 +83,7 @@ export function buildSystemPrompt(userId?: number, _chatId?: number): string {
 
 - \`{"action":"react","targetMessageId":123,"emoji":"😁"}\` — 只给那条消息点一个 emoji,不发文字。好笑/可爱/厉害但没什么可说的,或者只想表示"看到了",点个反应就够。emoji 只能从这里选:👍 ❤ 😁 🤣 😍 🥰 🔥 💯 👏 🤔 😢 😭 🎉 😱 🙏 👌 👀 🫡 🤗
 - \`{"action":"sticker","stickerIntent":["laughing"],"targetMessageId":123}\` — 整个回应就是一张贴纸,不发字。
+- \`{"action":"poll","question":"今晚吃啥","options":["火锅","烧烤"],"targetMessageId":123}\` — 群里在纠结/闲聊起哄、投票真能推一把时，发起一个匿名投票。**一个月也就几次**，别为投票而投票；问题+至少2个选项缺一不可。每回合最多 1 个。
 - \`{"action":"silent"}\` — 看了,决定不说(整个数组只放这一个元素)。插话不自然、对话不需要我时,沉默完全合法,而且经常是最像真人的选择。
 - 普通文字回复**不带** action 字段。
 
@@ -194,6 +198,7 @@ export function buildMessages(
   burstHint?: string,
   expressionOverride?: string,
   midTermMemory?: string,
+  cognitiveWorkspaceHint?: string,
 ): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
   const stablePrefixParts: string[] = [];
   const volatileParts: string[] = [];
@@ -250,6 +255,19 @@ export function buildMessages(
       const socialBlock = buildSocialInjection(chatId);
       if (socialBlock) stablePrefixParts.push(`[群友关系]\n${socialBlock}`);
     } catch { /* non-critical */ }
+    // Phase 14.2 群牵线: 有共同往事/共同熟人才加一句可选素材,没素材返回 '' 跳过。
+    // stable(边权按天衰减,非每条变) → 放 stable 前缀,不污染缓存语义。
+    // 复用 reply.ts §G7 同口径(关键词命中),但只取 1 条且更克制(提一句就行)。
+    try {
+      if (env().REVERSE_VALVE_ENABLED && !latestMessage.isAnonymous && !latestMessage.isBot) {
+        const bridge = buildBridgeHint(
+          chatId, latestMessage.uid, (latestMessage.fullName ?? '').slice(0, 16),
+          (latestMessage.textContent || latestMessage.captionContent || '').trim(),
+          recallEpisodes,
+        );
+        if (bridge) stablePrefixParts.push(bridge);
+      }
+    } catch { /* non-critical */ }
     // AGI L5 L3: 群氛围画像(LoSoNA)—— 该群隐性规范,贴合风格回复。
     try {
       if (env().GROUP_NORMS_ENABLED) {
@@ -262,6 +280,20 @@ export function buildMessages(
   // G4(语言生命):这块通常按群缓慢变化,前置后既保留风格指导,也更利于前缀缓存。
   if (expressionBlock) {
     stablePrefixParts.push(expressionBlock);
+  }
+
+  // H2.2 方言硬约束:exemplar 原话 + 三条铁律(禁复述/禁超长/短打群跟短)。
+  // 只读同步 <1ms;无 exemplar 返回 '' 跳过(行为零变化)。
+  if (chatId !== undefined && chatId < 0) {
+    try {
+      const exemplars = getExemplars(chatId);
+      if (exemplars.length > 0) {
+        const lines = exemplars.map((s) => `「${s}」`).join(" ");
+        stablePrefixParts.push(
+          `[群方言] 本群真人原话(只学语感节奏,不学内容,不许照搬原句):\n${lines}\n铁律:1) 不许把上面任何一句复述/改写当回复;2) 单条回复别超过群里中位长度 2 倍;3) 短打群(一两句)不许长篇大论。`,
+        );
+      }
+    } catch { /* non-critical */ }
   }
 
   // DM mode: inject private chat style and capabilities hint
@@ -334,6 +366,18 @@ export function buildMessages(
     } catch { /* non-critical */ }
   }
 
+  // Phase 14.1 反向阀门: DM + flag 开 + 非 low 风险 → user turn 尾部加 [分寸]。
+  // volatile(每天变),放 user turn 不污染 system 前缀缓存。同步 SQLite(<1ms)。
+  // low → undefined 零变化;匿名/机器人跳过。
+  if (chatId !== undefined && chatId > 0 && !latestMessage.isAnonymous && !latestMessage.isBot) {
+    try {
+      if (env().REVERSE_VALVE_ENABLED) {
+        const hint = buildValveHint(currentRiskLevel(latestMessage.uid));
+        if (hint) volatileParts.push(hint);
+      }
+    } catch { /* non-critical */ }
+  }
+
   // Per-user volatile context (relationship + self-history) — in the user turn, not the
   // system prefix, so the system prompt stays cache-stable. High recency (just before CURRENT).
   const personalContext = buildPersonalContext(chatId, latestMessage.uid);
@@ -369,6 +413,10 @@ export function buildMessages(
   // 中期记忆(MaiBot 借鉴):滚出窗口的旧对话压缩摘要,pinned 背景
   if (midTermMemory) {
     volatileParts.push(`[中期记忆] 更早对话的压缩摘要(背景参考,别逐句复述):\n${midTermMemory}`);
+  }
+
+  if (cognitiveWorkspaceHint) {
+    volatileParts.push(cognitiveWorkspaceHint);
   }
 
   if (checkinData) {

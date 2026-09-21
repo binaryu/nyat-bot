@@ -24,6 +24,7 @@ import { needsLookup } from "./path-heuristic.js";
 import { logger } from "../../shared/logger.js";
 import { buildDeferEntry } from "../shared.js";
 import { env } from "../../env.js";
+import { dispatchWaitViaAgency } from "../../agent/agency-wait-dispatch.js";
 
 export interface HeartResult {
   /** true = pipeline should return immediately (side effects + logging already done) */
@@ -177,7 +178,27 @@ export async function runHeartBranch(ctx: {
       );
       return { shouldReturn: true };
     }
+    // The workspace is an opt-in companion to Heart. Start it beside the
+    // self-state reads so the fast path pays neither import nor DB cost.
+    const cognitiveWorkspacePromise = e.COGNITIVE_WORKSPACE_V2_ENABLED
+      ? (async () => {
+        try {
+          const { buildCognitiveWorkspace, renderCognitiveWorkspace } = await import('../../agent/cognitive-workspace.js');
+          const snapshot = await buildCognitiveWorkspace({
+            chatId: job.chatId,
+            ...(!formatted.isAnonymous && formatted.uid > 0 ? { userId: formatted.uid } : {}),
+            queryText: (formatted.textContent || formatted.captionContent || '').slice(0, 800),
+            asOfEventId: job.cognitiveAnchorEventId,
+          });
+          return renderCognitiveWorkspace(snapshot, 2200);
+        } catch (err) {
+          logger.debug({ err, chatId: job.chatId }, 'Heart cognitive workspace failed (non-critical)');
+          return undefined;
+        }
+      })()
+      : Promise.resolve(undefined);
     const selfState = await composeSelfState(job.chatId);
+    const cognitiveWorkspaceHint = await cognitiveWorkspacePromise;
     // 审计 #38 slice 2:快照挂上 turnContext,写手同回合直接复用
     job.turnContext.selfState = selfState;
     let lastSpokeSecAgo: number | undefined;
@@ -192,6 +213,7 @@ export async function runHeartBranch(ctx: {
       botName: getBotDisplayName(),
       selfState,
       lastSpokeSecAgo,
+      cognitiveWorkspaceHint,
       burstNote: [
         heartBurstIds.length > 1
           ? `(★ 是一波 ${heartBurstIds.length} 条连发的末尾,把整波当一个完整念头来评估)`
@@ -212,26 +234,29 @@ export async function runHeartBranch(ctx: {
     // resume 再撞坏链路,恶性循环。改为 MaiBot 不变量:任何"先不回"必须
     // 物化为会再触发的状态 —— defer 重评(预算内),预算耗尽回退 legacy
     // judge(judge 用 stepfun 主标签,与 heart 不同链)出真裁决。
-    if (heart.act === 'pass' && heart.why === 'llm_failed') {
+    if (heart.act === 'pass' && (heart.why === 'llm_failed' || heart.why === 'parse_failed')) {
+      const isParse = heart.why === 'parse_failed';
       if (hasDeferBudget(job.turnContext.deferCount)) {
         const rescheduled = await scheduleGateDeferReeval({
           chatId: job.chatId,
           entry: buildDeferEntry(job, formatted),
           deferCount: job.turnContext.deferCount ?? 0,
-          retryAfterMs: 30_000,
-          reason: 'heart_llm_failed_defer',
+          retryAfterMs: isParse ? 10_000 : 30_000,
+          reason: isParse ? 'heart_parse_failed_defer' : 'heart_llm_failed_defer',
         }).catch(() => false);
         if (rescheduled) {
           logger.warn(
             { chatId: job.chatId, uid: formatted.uid },
-            "Heart infra failure → timed re-eval scheduled",
+            isParse ? "Heart parse failure → timed re-eval scheduled" : "Heart infra failure → timed re-eval scheduled",
           );
           return { shouldReturn: true };
         }
       }
       logger.warn(
         { chatId: job.chatId, deferCount: job.turnContext.deferCount },
-        "Heart infra failure, defer budget exhausted → legacy judge fallback",
+        isParse
+          ? "Heart parse failure, defer budget exhausted → legacy judge fallback"
+          : "Heart infra failure, defer budget exhausted → legacy judge fallback",
       );
       judgeResult = await judge({
         message: formatted, recentMessages,
@@ -258,7 +283,10 @@ export async function runHeartBranch(ctx: {
         try {
           await setWaitAnchor(job.chatId, {
             update: job.update, chatId: job.chatId,
-            messageId: formatted.messageId, enqueuedAt: job.enqueuedAt, waitReplay: true,
+            messageId: formatted.messageId,
+            enqueuedAt: job.enqueuedAt,
+            cognitiveAnchorEventId: job.cognitiveAnchorEventId,
+            waitReplay: true,
             waitStartedAt: Date.now(),
             obligationId: job.turnContext.obligationId,
             obligationTargetUid: job.turnContext.obligationTargetUid,
@@ -266,10 +294,30 @@ export async function runHeartBranch(ctx: {
           }, waitSec + 120);
         } catch { /* non-critical */ }
       }
-      await transitionToWait(
-        job.chatId, waitSec, formatted.messageId, formatted.uid,
-        job.turnContext.obligationId,
-      );
+      const agencyWait = await dispatchWaitViaAgency({
+        chatId: job.chatId,
+        triggerMessageId: formatted.messageId,
+        ...(formatted.uid > 0 ? { triggerUserId: formatted.uid } : {}),
+        waitSec,
+        reason: `heart:${heart.why || 'wait'}`,
+        source: 'heart',
+        ...(job.turnContext.obligationId ? { obligationId: job.turnContext.obligationId } : {}),
+        ...(job.cognitiveAnchorEventId ? { cognitiveAnchorEventId: job.cognitiveAnchorEventId } : {}),
+      });
+      if (agencyWait.attempted) {
+        if (!agencyWait.accepted) {
+          logger.warn(
+            { chatId: job.chatId, messageId: formatted.messageId, agencyRunId: agencyWait.agencyRunId, reason: agencyWait.reason },
+            'Heart wait rejected by Agency authority transport',
+          );
+          return { shouldReturn: true };
+        }
+      } else {
+        await transitionToWait(
+          job.chatId, waitSec, formatted.messageId, formatted.uid,
+          job.turnContext.obligationId,
+        );
+      }
       logger.info({ chatId: job.chatId, why: heart.why, triggerUid: formatted.uid }, "Pipeline complete (heart=wait)");
       return { shouldReturn: true };
     }

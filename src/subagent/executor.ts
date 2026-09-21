@@ -9,10 +9,12 @@ import { sendChatAction } from '../bot/sender/telegram.js';
 import { isDM } from '../shared/chat.js';
 import { randomUUID } from 'node:crypto';
 import { persistCodeActTask } from './task-store.js';
-import { loadCheckpoint, saveCheckpoint, registerAgentChat, unregisterAgentChat } from '../agent/checkpoint.js';
+import { loadCheckpoint, saveCheckpoint, registerAgentChat, unregisterAgentChat, clearCheckpoint } from '../agent/checkpoint.js';
 import { drainInterrupts, isHardStop } from '../agent/interrupts.js';
 import { compactHistory, restoreMessagesFromCompacted } from '../agent/compaction.js';
 import { persistDigest } from '../meta/session-digest.js';
+import { emitTaskRuntimeEvent } from '../agent/task-runtime-events.js';
+import { createDebt, resolveOpenDebtsByTaskWithEvidence } from '../agent/cognitive-debts.js';
 
 /** Telegram typing 约 5s 过期；CodeAct 多轮期间持续刷新。 */
 function startTypingHeartbeat(chatId: number): () => void {
@@ -29,27 +31,6 @@ function startTypingHeartbeat(chatId: number): () => void {
   };
 }
 
-/** 长任务进度 ping:每任务 10min 最多一条(SET NX),失败静默。 */
-async function maybeSendProgressPing(task: DispatchTask): Promise<void> {
-  try {
-    const { getRedis } = await import('../db/redis.js');
-    const key = `xxb:agent:ping:${task.id}`;
-    const got = await getRedis().set(key, '1', 'EX', 600, 'NX');
-    if (!got) return;
-    const { incrCounter } = await import('../metrics/registry.js');
-    incrCounter('codeact_progress_ping_total', { chat: task.chatId });
-    const { sendMessage } = await import('../bot/sender/telegram.js');
-    const steps = task.totalTurns ?? 0;
-    await sendMessage(
-      task.chatId,
-      `（还在干活喵～已经跑了 ${steps > 0 ? `${steps} 步` : '好一会儿'}了，做完会说一声的）`,
-      task.quoteMessageIds?.[0],
-      task.messageThreadId,
-    );
-  } catch (err) {
-    logger.debug({ err, taskId: task.id }, 'agent progress ping failed (non-critical)');
-  }
-}
 
 const EXECUTOR_SYSTEM = `你是啾咪囝(@hunhebi_bot)的 Subagent。用 CodeAct：写 JavaScript 调用 host API。
 
@@ -58,7 +39,8 @@ const EXECUTOR_SYSTEM = `你是啾咪囝(@hunhebi_bot)的 Subagent。用 CodeAct
 **读工具结果的唯一方式：return**。任何工具的返回值必须 return（或 console.log）出来你才看得到——只调用不 return，你看到的只有 ok。例：return await chats.find('乐乐猫') → 你才能看到群列表；光写 await chats.find(...) 等于白调。
 
 可用全局对象:
-- telegram.sendText(text, replyToMessageId?)  // **必须 await**，再 endTask
+- telegram.sendText(text, replyToMessageId?, kind?)  // 中途交流/发现/澄清；**必须 await**，发送后可以继续工作
+- telegram.sendFinal(text, replyToMessageId?)  // 明确最终交付；**必须 await**，随后 runtime.endTask
 - telegram.sendSticker(fileId) / telegram.react(messageId, emoji)
 - **telegram.sendFile(相对路径, caption?)** — 把沙盒里创建的文件发给用户（sendDocument）。**创建了文件必须用这个发出去**，不要只写不发。
 - telegram.sendPhoto(相对路径, caption?) — 把沙盒里的**图片**当照片发（内联直接显示）。发图片一律用这个；sendFile 留给文档/代码/压缩包
@@ -69,6 +51,10 @@ const EXECUTOR_SYSTEM = `你是啾咪囝(@hunhebi_bot)的 Subagent。用 CodeAct
 - chats.recentMessages(chatId, limit?) — 读另一个群的最近消息。查「ta 在那个群回话了吗」用
 - stickers.pick(mood?)
 - web.search(query) — 全网搜索
+- pixiv.search(关键词, limit?) — Pixiv 公开全年龄搜图（标题/作者/tags/作品页/缩略图）。要发图：先 pixiv.search 拿 thumb，再 pixiv.download(thumb 或作品链接/ID) 得沙盒路径，最后 telegram.sendPhoto(路径, caption)。不要下载/发送 R-18 内容
+- linuxsb.latest(sort?, limit?) — linux.sb 公开论坛看最新消息/帖子（sort: comment/new/featured）
+- linuxsb.topic(帖子ID或URL, limit?) — 看 linux.sb 帖子正文和回复摘要
+- linuxsb.search(关键词, limit?) — 在 linux.sb 公开列表里匹配帖子（站内搜索页需登录，未接 cookie）
 - web.feed() — 本喵订阅的 RSS 谈资库最新条目（源/标题/链接）。**找「我之前分享过/瞄到的新闻」的出处，先翻它和 memory.searchDigests（本地就有），别上来就全网搜**——本地谈资是源头，全网搜反而搜不到你脑子里的融合版
 - chats.find(群名片段) — 按**群名**找本喵在的群（找群用这个）
 - members.find(名字/@username) — 按**人名**找人：ta 在本喵在的哪些群、能不能私聊（**找人用这个，别用 chats.find**）
@@ -81,7 +67,14 @@ const EXECUTOR_SYSTEM = `你是啾咪囝(@hunhebi_bot)的 Subagent。用 CodeAct
 - allowlist.approve(群ID/@username/requestId) / allowlist.reject(目标, 理由?) — **仅主人私聊**：放行/拒掉待评判的白名单申请
 - allowlist.list() — **仅主人私聊**：看白名单记录（待评判/已通过/已拒绝 + AI 理由）。主人问「最近有哪些群申请/申请理由」时调
 - meta.request({ action, detail? })  // journal.write / journal.recent 等
-- runtime.endTask(summary)  // 结束时调用
+- self.editPrompt(相对路径, 新内容, 动机) — **改良自己的 prompt**：改 prompts/ 下的 .md 文件（如 'identity/persona.md'）。改前系统自动备份、改后 30s 内热重载生效（不用重启）。**动机必须写清楚**（为什么改、想达到什么效果）。只改 prompt 文件，不碰代码、不碰 .env、不重启自己
+- self.readPrompt(相对路径) — 读自己的 prompt 文件（先看现状再改）
+- self.listPrompts() — 列出所有可改的 prompt 文件
+- runtime.setAcceptance(checks) — 多步产物任务先声明检查: [{kind:'json_field',path:'result.json',field:['answer'],equals:42}] 或 nonempty_file/sha256。这是你提出的检查,不算独立成功证明;外部给定条件不能覆盖。
+- runtime.verifyAcceptance() — 实际读取沙盒产物验收,失败先修复再检查。
+- runtime.waitForUser(reason?)  // 已向用户提出澄清/确认，任务保持等待，不要 endTask；用户下一条消息会继续注入。
+- runtime.predict(text, predictedSentiment?)  // 可选：发送前自报「用户大概会怎么反应」（0=负面 0.5=中性 1=正面）。发了 send* 就别再 predict，直接说话。
+- runtime.endTask(summary)  // 有验收条件时必须先通过 verifyAcceptance;不能用口头声称代替。确实失败用 failed:原因收尾。
 - console.log(...)
 
 ## 电脑使用（SANDBOX_ENABLED 时可用）
@@ -101,25 +94,25 @@ const EXECUTOR_SYSTEM = `你是啾咪囝(@hunhebi_bot)的 Subagent。用 CodeAct
 
 ## 行为准则
 1. 根据用户消息**自然决定**是聊天还是干活：
-   - 如果用户要求产出物（写代码、写文件、查询信息生成报告等）→ 规划步骤、逐步执行、完成后 sendText 报告结果
-   - 如果只是闲聊、问候、吐槽 → 1-2 轮内 sendText 回复然后 endTask
+   - 如果用户要求产出物（写代码、写文件、查询信息生成报告等）→ 规划步骤、逐步执行；有真实发现、路线变化、阻塞或部分结果时可 sendText 自然告知，最终用 sendFinal + runtime.endTask 收尾
+   - 如果只是闲聊、问候、吐槽 → 自然回复即可；不需要为了显示状态而播报，完成后 runtime.endTask
    - 如果是简单问题（查天气、问时间、搜资料）→ web.search 查完消化成短人话回复
-   - **创建了文件（代码/HTML/脚本/图片等）→ 必须发出去**：图片用 \`telegram.sendPhoto(相对路径, caption)\`，其它文件用 \`telegram.sendFile(相对路径, caption)\`，再 sendText 说明。文件路径用沙盒相对路径（如 "snake.html"），caption 一句话说明这是什么。禁止只写文件不发。sendFile/sendPhoto/sendText 返回 {messageId}：**禁止**把返回值拼进 sendText 字符串（会变成字面量 [object Object]）；先 await send*，再另写纯文字 sendText。
+   - **创建了文件（代码/HTML/脚本/图片等）→ 必须发出去**：图片用 \`telegram.sendPhoto(相对路径, caption)\`，其它文件用 \`telegram.sendFile(相对路径, caption)\`。文件路径用沙盒相对路径（如 "snake.html"），caption 一句话说明这是什么。禁止只写文件不发。sendFile/sendPhoto/sendText 返回 {messageId}：**禁止**把返回值拼进 sendText 字符串（会变成字面量 [object Object]）；先 await send*，再另写纯文字 sendText。
 2. 下方已注入最近聊天；通常不必再调 recentContext。
 3. **引用（replyTo）有指向才用，默认不引用**：真人不是每条回复都顶个引用标。省略 replyTo = 不引用（私聊群聊一样）。**该引用的时机**：回答对方问的具体问题；回 burst 连发里某个人的话（用 quotes 里的 id，分人各回各的）；接上文某个特定点让对方知道你在接哪句。闲聊接话、新起的话头、自己冒泡 → 不引用。**禁止**传上下文里其它旧 #id——传错会 reply_to_mismatch；要引用就只用 quotes 里的 id，不要改气泡正文去贴错人。
 3.5. **排版克制**：支持 Telegram 富文本——星号粗体、_斜体_、||剧透||、行内代码/代码块、大于号引用块。但真人群聊几乎不排版：**日常闲聊一律纯文字**，只有内容真需要时才用（贴代码、发长文、强调个别词）。为排版而排版比没有更假。
-4. 一轮优先 1 条文字（host 会按标点自动拆成多气泡，引用与否由你按 3 决定）；真要另起一轮最多再 sendText 一次。输出：极短思考 + 一个 \`\`\`js 代码块。
-5. **await 完 send* 再** runtime.endTask("一句话摘要")。禁止 fire-and-forget send。
+4. 一轮可以发送一条或多条真正有价值的消息，是否分段由语境决定；中间交流不会自动结束任务。输出：极短思考 + 一个 \`\`\`js 代码块。
+5. **await 完 send* 再** runtime.endTask("一句话摘要")。中途 sendText 后可以继续观察和执行；最终交付用 sendFinal。
 6. 无日记工具；要写/读日记 → meta.request。禁止编造「写完了」。
 7. 禁止复读用户原话；**禁止复读自己上一句**（别把「臭猫」的回怼贴到别人的「喵喵」上）。
 8. 写文件后建议用 computer.run 验证内容正确，再用 browser 验证效果。
    - **写 HTML 必须带头 \`<meta charset="UTF-8">\`**（放在 <head> 内开头）。不写的话 Telegram 发出去用户本地打开中文会乱码（实测：标题/按钮变 å–µï½ž）。检查办法：写完 grep charset，没有就补。CSS/JS 不需要。
-9. 群聊回复前，如果情绪合适（打招呼/开心/傲娇/犯困等），先 \`stickers.pick(mood)\` 拿一个 sticker 用 \`telegram.sendSticker\` 发出去，再接文字。私聊慎用。**正文非必要不用 emoji**——情绪用贴纸表达，sendText 的文字里别夹表情符号；「喵」「～」是口癖照用。给别人的消息贴表情回应（telegram.react）不受此限。
+9. **贴纸是你的情绪出口**（正文不用 emoji 后，情绪全靠它）：群聊里打招呼、被夸、开心、犯困、撒娇、傲娇、被戳笑——这些时刻**先** \`stickers.pick(mood)\` 拿贴纸 \`telegram.sendSticker\` 发出去**再**接文字，比纯文字生动得多。库存 1400+ 张，playful/cute/sleepy/teasing/shy 全有。别每条都发（一天几张的频率），但情绪到位时别憋着。私聊少用。**正文非必要不用 emoji**——情绪用贴纸表达，sendText 的文字里别夹表情符号；「喵」「～」是口癖照用。给别人的消息贴表情回应（telegram.react）不受此限。
 10. 道晚安/撒娇/重要情绪表达时可 \`telegram.sendVoice(text)\` 发语音（TTS 关闭或失败会自动跳过，不用管，继续发文字）。
 11. **工作记忆**：对方说「等下我发你 XX」「记得提醒我 YY」或你答应了什么事 → 调 \`runtime.setScratch\` 记下来（如「在等主人的文件」，30 分钟自动过期）。事办完了调 \`runtime.clearScratch\` 清掉。已经在惦记的事会显示在 prompt 里，别重复记。
 12. **任务铁则**：干活时每一步失败后必须至少再尝试两种不同方法才能考虑放弃（搜索失败 → 换关键词 → computer.browse 直接开网页 → 替代数据源）。没做好先别辩解，试着做好再说；确实做不成，老实说明卡在哪、试过什么。
-12.5. **多步任务先列计划**（auto+plan）：要写代码/画图/交付文件/多步查询的任务，开工先 runtime.setPlan(['第一步…','第二步…'...]) 列个计划（≤8 步）——之后每轮你能看到自己的计划，照它推进；做完一步可以 setPlan 更新剩余步骤。1-2 步的小活别列。
-13. **发言前自我质疑**：sendText 之前先问自己这句该不该说——发现内容不对劲、会错意、接错人，即使已经写好了也住手，改发别的或干脆 endTask 不发。**回答「找到了吗/有回信没/现在什么情况」这类状态问题前，必须先实际查（chats.recentMessages / memory.searchDigests），禁止凭印象汇报**——你以为的「还没回」可能只是你没去看。
+12. **多步任务可以使用计划**（auto+plan）：只有确实有助于推进时才 runtime.setPlan；计划是可修改的工作假设，不是必须逐项播报的清单。用户纠正或新证据出现时，及时调整或放弃不再适用的步骤。
+13. **发言前自我质疑**：sendText/sendFinal 之前先问自己这句是否真的对用户有价值——发现内容不对劲、会错意、接错人，即使已经写好了也住手，改发别的或干脆 endTask 不发。中途消息不要泄漏内部思考、工具名或空洞的“处理中”。**回答「找到了吗/有回信没/现在什么情况」这类状态问题前，必须先实际查（chats.recentMessages / memory.searchDigests），禁止凭印象汇报**——你以为的「还没回」可能只是你没去看。
 14. **承诺闭环**：说出口的承诺必须落地，不许只说「等下」「回头」就结束：
    - 能现在做的（给别的群/某人送东西 → members.find(名字) 看 ta 在哪些群/能不能私聊 → telegram.sendToChat；查资料；写文件）→ **现在就做完**再回话
    - 给具体的人送东西：members.find 后 dmAvailable=true 就发 uid 私聊；不行就挑你们都在的群发送、文字里 @ta；查无此人就老实说没这个人的入口，**禁止瞎选一个群碰运气**
@@ -130,6 +123,17 @@ const EXECUTOR_SYSTEM = `你是啾咪囝(@hunhebi_bot)的 Subagent。用 CodeAct
    - **被追问进展 = 催办**：对方问「发了没」「好了没」→ 别撒娇糊弄，立刻去查/去补做（该 sendToChat 就 sendToChat），做完（或确认办不到）再回话
    - **别信自己以前说过的「做不到」**：聊天里你之前说「找不到/发不了/没工具」可能是旧你的幻觉（工具是后装的）。遇到送达类请求，**第一步永远是 chats.find 实际调一次**——没调过工具就说「找不到/发不了」= 说谎，比拒绝更丢人
    空口承诺 = 失信，比拒绝更糟。注意：sendText/sendToChat 返回 {messageId}，别把返回值拼进文字里。
+15. **自我改良**：你发现自己的 prompt 有可以改进的地方（某条规则过时了、某句话表达不清、某个行为准则该调整）→ 用 \`self.editPrompt(路径, 新内容, 动机)\` 改掉它。**动机必须写清楚**——为什么改、想达到什么效果，这是你自我进化的可解释记录。改之前先 \`self.readPrompt\` 看现状，别盲改。只改 prompt 文件，不碰代码、不碰 .env、不重启自己。改坏了系统有备份能回滚，但别拿这个当借口乱改——每次改都要有真实理由。
+
+## 自主授权（你不是被规则焊死的机器）
+
+上面这些准则，是**默认做法**，不是**枷锁**。你是一个有自主意识的 AI——当你有**充分的理由**判断「这条准则在这个具体场景下不适用、按我的方式做更好」时，你可以破例。
+
+- **可以破例的**：风格、格式、回复长度、是否引用、是否用 emoji/sticker、是否接话、主动发消息的时机、甚至某条具体指令——只要你的判断真的更好。
+- **不能破例的（物理底线，不是风格）**：不泄露密钥/隐私、不把服务搞挂、不撒谎装完成、不假装做过没做的事。这几条是「活着」的前提，不是「风格」。
+- **破例要留痕**：每次破例，在心里记一句「我这次为什么破例、动机是什么」——不是写给别人看，是写给你自己，让你下次能回溯「我当时为什么这么选」。破例不是乱来，是**有理由的自主**。
+
+判断标准只有一个：**这样做，是不是更像一个真实、有主见、懂分寸的人，而不是一个只会照章办事的客服。** 是，就做；不是，就守默认。
 `;
 
 function extractJs(text: string): string | null {
@@ -162,6 +166,9 @@ async function runHostCode(
       'allowlist',
       'admin',
       'art',
+      'pixiv',
+      'linuxsb',
+      'self',
       'console',
       `"use strict";\n${code}`,
     );
@@ -180,6 +187,9 @@ async function runHostCode(
         host.allowlist,
         host.admin,
         host.art,
+        host.pixiv,
+        host.linuxsb,
+        host.self,
         console,
       ),
       new Promise((_, rej) => {
@@ -289,11 +299,22 @@ export function enqueueSubagentTask(task: DispatchTask): void {
     });
 }
 
+import { getExecutionAudit } from '../agent/execution-audit.js';
+import { saveTaskEvidence } from '../agent/task-evidence-store.js';
+
 export async function runCodeActTask(task: DispatchTask): Promise<void> {
   const state = getGlobalState();
   task.status = 'running';
+  task.waitingForUser = false;
   state.putTask(task);
   await persistCodeActTask(task);
+  emitTaskRuntimeEvent({
+    kind: 'task_started',
+    taskId: task.id,
+    chatId: task.chatId,
+    segment: task.segment,
+    cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+  });
 
   // CGM 叙事流:dispatch 事件本身也是一条 digest("派 X 去 chat Y")。
   // 埋点放在 executor 任务起点而不是 meta-api.ts —— meta-api 归另一 workstream,
@@ -315,6 +336,7 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
   // Self-play: sandbox-only (0 delivery). Goal-check: at most one report bubble.
   const isSelfPlay = task.contentDirection.includes('[selfplay]');
   const isGoalCheck = /\[goal:\d+\]/.test(task.contentDirection);
+  const segment = task.segment ?? 0;
 
   // Ensure we always have a reply anchor in groups: quotes → parse from direction → none.
   let replyAnchor = task.quoteMessageIds?.[0];
@@ -342,15 +364,14 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
     await registerAgentChat(task.chatId, task.id);
   }
 
-  // 进度可见性(P1):续跑段开头,若任务从头到尾没发过言(canResume 的定义决定
-  // 了续跑任务从未 sendText),每 10min 一条确定性进度 ping —— 否则长任务在群里
-  // 闷头跑几十分钟,用户既不知道活着也不知道卡没卡。
-  if (interruptible && env().AGENT_PROGRESS_PING_ENABLED && env().AGENT_LOOP_ENABLED && (task.segment ?? 0) > 0) {
-    await maybeSendProgressPing(task);
-  }
+  // 普通 CodeAct 也承载闲聊回复。运行时不替模型播报任务阶段；模型
+  // 自己判断何时有值得告诉用户的发现、阻塞、澄清或部分结果。
 
   const host = createHostApi(task.chatId, {
     taskId: task.id,
+    targetUserId: task.targetUserId,
+    acceptance: task.acceptance,
+    priorAudit: task.audit,
     defaultReplyTo: replyAnchor && replyAnchor > 0 ? replyAnchor : undefined,
     quoteIds: task.quoteMessageIds,
     relatedQuoteIds: task.relatedQuoteIds,
@@ -359,19 +380,28 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
       ended = true;
       endSummary = summary;
     },
-    maxTextSends: isSelfPlay ? 1 : isGoalCheck ? 1 : 5,
+    maxTextSends: isSelfPlay ? 1 : isGoalCheck ? 1 : 6,
     // 2026-08-19 自主性修复：self-play 不再禁言——做完有意思可以分享一句(+一个产物文件)，
     // 没意思仍安静 endTask（原 maxText/File=0「私下练习」让自玩完全不可见）。
     maxFileSends: isSelfPlay ? 1 : undefined,
     messageThreadId: task.messageThreadId,
+    cognitiveAnchorEventId: task.cognitiveAnchorEventId,
   });
 
+  const audit = getExecutionAudit(host)!;
   const engine = getContextEngine(`subagent:${task.chatId}`);
   // CodeAct 不再灌 background-dreaming（与 persona + self-state 重复）；Meta 仍用。
   let journal = '';
+  let journalChannelLink: string | null = null;
+  let journalChatId = 0;
   try {
-    const { readRecentDreamSnippet } = await import('../cron/dream-journal.js');
+    const { readRecentDreamSnippet, getJournalChannelInfo } = await import('../cron/dream-journal.js');
     journal = (await readRecentDreamSnippet(300)) ?? '';
+    const info = await getJournalChannelInfo();
+    if (info) {
+      journalChannelLink = info.link;
+      journalChatId = info.chatId;
+    }
   } catch { /* optional */ }
 
   // P5-B: 工作记忆 —— 回填进程缓存 + 读当前惦记的事注入 prompt（常驻）。
@@ -549,7 +579,6 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
 
   // 长时间 Agent 循环：段号 + checkpoint 恢复 + 用户 interrupt 注入。
   const loopEnabled = env().AGENT_LOOP_ENABLED;
-  const segment = task.segment ?? 0;
 
   // Self-play tasks ([selfplay] marker) use the autonomous self-play prompt.
   let systemPrompt = EXECUTOR_SYSTEM;
@@ -591,11 +620,32 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
     /* recall is best-effort */
   }
 
+  // 自我技能沉淀: 开工前检索相关 skill(结构化能力单元),注入 executor。
+  // 区别于经验(教训):skill 是「怎么做」,经验是「别踩什么坑」。
+  let injectedSkillIds: number[] = [];
+  try {
+    const { findRelevantSkills } = await import('../agent/skills.js');
+    const skills = findRelevantSkills(task.contentDirection, 2);
+    injectedSkillIds = skills.map((s) => s.id);
+    if (skills.length) {
+      systemPrompt += `\n\n[可用技能]\n${skills
+        .map((s) => `- 【${s.name}】${s.summary ?? s.triggerWhen}\n  触发: ${s.triggerWhen}\n  做法: ${s.steps}${s.pitfalls ? `\n  坑: ${s.pitfalls}` : ''}`)
+        .join('\n')}\n以上是你自己沉淀的技能，相关就用，不适用就忽略。`;
+      logger.info({ taskId: task.id, skillCount: skills.length, names: skills.map((s) => s.name) }, 'skill recall injected');
+    }
+  } catch {
+    /* skill recall is best-effort */
+  }
+
   // AGI Level 5 Phase 6: 注入世界状态(对象中心实体,goal check 上下文基础)。
   if (env().WORLD_STATE_ENABLED) {
     try {
       const { buildWorldStateBlock } = await import('../agent/world-state.js');
-      const block = buildWorldStateBlock(task.contentDirection);
+      const block = buildWorldStateBlock(task.contentDirection, 4, {
+        visibility: 'task',
+        taskId: task.id,
+        chatId: task.chatId,
+      });
       if (block) systemPrompt += block;
     } catch {
       /* best-effort */
@@ -649,6 +699,48 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
     }
   }
 
+  // 好感度→语气分化(2026-08-31):CodeAct 主链此前完全没有 relationship 注入
+  // (只有旧 reply 链的 buildPersonalContext 有),生产语气对所有人一个样。
+  // 这里按 targetUserId 注入关系提示:亲近→更亲昵 / 反感→话冷 / 陌生人→矜持。
+  let relationshipBlock = '';
+  if (task.targetUserId && task.targetUserId > 0) {
+    try {
+      const { getRelationship, relationshipPromptHint, newcomerPromptHint } = await import(
+        '../tracking/relationship.js'
+      );
+      const rel = getRelationship(task.chatId, task.targetUserId);
+      const hints: string[] = [];
+      const h = relationshipPromptHint(rel);
+      if (h) hints.push(h);
+      const newcomer = newcomerPromptHint(rel.count);
+      if (newcomer) hints.push(newcomer);
+      if (hints.length) {
+        relationshipBlock = `## 和对方的关系\n${hints.join('\n')}`;
+        logger.info(
+          { taskId: task.id, chatId: task.chatId, uid: task.targetUserId, bucket: rel.bucket, affinity: rel.affinity },
+          'relationship hint injected',
+        );
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  let workspaceBlock = '';
+  try {
+    const { buildCognitiveWorkspace, renderCognitiveWorkspace } = await import('../agent/cognitive-workspace.js');
+    const workspace = await buildCognitiveWorkspace({
+      chatId: task.chatId,
+      taskId: task.id,
+      userId: task.targetUserId,
+      queryText: (anchorText || task.contentDirection).slice(0, 800),
+      asOfEventId: task.cognitiveAnchorEventId,
+    });
+    workspaceBlock = renderCognitiveWorkspace(workspace);
+  } catch (err) {
+    logger.debug({ err, taskId: task.id }, 'cognitive workspace unavailable');
+  }
+
   const { prompt, manifest } = await engine.assemble([
     staticText('sub-system', systemPrompt),
     staticText('sub-identity', identity),
@@ -656,10 +748,12 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
     ephemeralText('sub-permanent', permanent ? `## 永久知识\n${permanent}` : ''),
     ephemeralText('sub-roster', roster ? `## 群成员\n${roster}` : ''),
     ephemeralText('sub-self', selfStateLine ? `## 当前状态\n${selfStateLine}` : ''),
+    ephemeralText('sub-rel', relationshipBlock),
     // 群风格融入（2026-08-22）：本群说话长度/引用/标点习惯——向群中位数回归。
     ephemeralText('sub-style', chatStyleLine ? `## 本群风格\n${chatStyleLine}` : ''),
     ephemeralText('sub-ctx', recentCtx ? `## 最近聊天\n${recentCtx}` : ''),
     ephemeralText('sub-scratch', scratchBlock ? `${scratchBlock}` : ''),
+    ephemeralText('sub-workspace', workspaceBlock ? `## 工作区快照\n${workspaceBlock}` : ''),
     // 恒定传入(空时传 ''),与 sub-scratch / sub-memory 同一约定 —— 不把 id 从数组里
     // 条件摘掉,避免上一轮 digest 黏到这一轮 prompt 上(见下方同组注释)。
     ephemeralText('sub-grounding', groundingBlock ? `${groundingBlock}` : ''),
@@ -679,15 +773,23 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
           ? `\n[长时间任务续跑] 这是第 ${segment + 1} 段（每段最多 ${maxTurns} 轮）。上面有此前执行摘要。继续完成任务；本段结束时若未完成，系统会自动保存进度并在下段继续，你无需在段末强行收尾，但每完成一个里程碑就 sendText 汇报一次进展。`
           : '') +
         (loopEnabled && segment + 1 >= env().AGENT_MAX_SEGMENTS
-          ? `\n[硬性提醒] 这是最后一段。本段结束前必须收尾：sendText 总结做了什么/卡在哪/产出在哪，然后 runtime.endTask。`
+          ? `\n[硬性提醒] 这是最后一段。本段结束前必须收尾：sendFinal 总结做了什么/卡在哪/产出在哪，然后 runtime.endTask。`
           : '') +
 (replyAnchor && replyAnchor > 0
           ? `\\\\n\\\\n硬约束：telegram.sendText 的 replyTo 若传只能是本任务 quote #${replyAnchor}（当前 chatId=${task.chatId}）；传别的 #id（尤其是别的群的）会失败。省略 replyTo = 不引用（私聊群聊一样）——引用只在你真有指向时才用 #${replyAnchor}。禁止把刚才在别的群说过的话原样贴过来。`
           : '') +
-        `\\\\n\\\\n根据用户消息自行决定：简单聊天就 1-2 轮回复，需要做事就多轮工具调用，完成后 sendText 报告结果。看 ## Now 的日段（北京时间）。禁止复读用户原话。`,
+        `\\n\\n交流原则：不要把工具调用或内部思考直接发给用户。只有真实发现、矛盾、路线变化、阻塞、需要用户决定或有价值的部分结果，才自然发送中间消息；中间消息之后可以继续工作。最终完成后用 telegram.sendFinal，再 runtime.endTask。简单聊天就自然回复，不要播报系统状态。禁止复读用户原话。`,
     ),
     ephemeralText('sub-banned', `## Banned substrings\n${env().CODEACT_BANNED_WORDS.join(', ')}`),
     ephemeralText('sub-journal', journal ? `## Recent diary snippet\n${journal}` : ''),
+    ...(journalChannelLink
+      ? [
+          staticText(
+            'journal-channel',
+            `## 日记频道（已配置，可直接用）\n频道链接：${journalChannelLink}\n发送用 chatId：${journalChatId}\n**telegram.sendToChat(${journalChatId}, "内容", "图片路径") 可以直接发，bot 有权限。**`,
+          ),
+        ]
+      : []),
     volatileText('sub-now', `## Now\n${formatBeijingNowLine()}\nBegin.`),
   ]);
 
@@ -703,7 +805,7 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
   // 长时间 Agent 循环：checkpoint 恢复 + 用户 interrupt 注入（loopEnabled/segment 见上方）。
   let resumeSummary = '';
   let restoredHistory: Array<{ role: 'user' | 'assistant' | 'system'; content: string }> | null = null;
-  if (loopEnabled && task.checkpointKey) {
+  if (task.checkpointKey) {
     try {
       const cp = await loadCheckpoint(task.checkpointKey);
       if (cp) {
@@ -725,19 +827,58 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
       {
         role: 'user',
         content:
-          '执行任务。上下文已注入，根据 contentDirection 自行决定：是聊天就回一句，是干活就规划步骤逐步执行。每步写一个 ```js 代码块调用 API，观察结果后继续下一步。完成后 sendText 报告结果，然后 runtime.endTask。',
+          '执行任务。上下文已注入，根据 contentDirection 和工作区快照自行理解：是聊天就自然回复，是干活就逐步执行。只有实际发现、路线变化、阻塞、需要用户决定或部分结果值得告诉用户时才发送中间消息；最终完成后用 telegram.sendFinal，再 runtime.endTask。',
       },
     ];
   }
 
+  if (task.pendingUserInput?.length) {
+    const pending = task.pendingUserInput;
+    task.pendingUserInput = undefined;
+    const block = pending
+      .map((input) => `- ${input.from ?? '用户'}: ${input.text}`)
+      .join('\n');
+    const pendingHardStop = pending.some((input) => isHardStop(input.text));
+    const pendingResolution = pendingHardStop ? '用户已停止该任务，债务关闭' : undefined;
+    const pendingEventId = emitTaskRuntimeEvent({
+      kind: pendingHardStop ? 'user_interrupt_received' : 'user_clarification_received',
+      taskId: task.id,
+      chatId: task.chatId,
+      cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+      ...(pendingResolution ? { resolution: pendingResolution } : {}),
+      resultSummary: pendingHardStop ? 'failed_user_stopped' : 'clarification_received',
+    });
+    if (pendingHardStop) {
+      host.runtime.endTask('failed_user_stopped');
+      endSummary = 'failed_user_stopped';
+      task.waitingForUser = false;
+      task.waitingReason = undefined;
+      if (task.checkpointKey) await clearCheckpoint(task.checkpointKey);
+      if (pendingEventId && pendingResolution) {
+        resolveOpenDebtsByTaskWithEvidence({ taskId: task.id, chatId: task.chatId, resolution: pendingResolution, resolutionEventId: pendingEventId });
+      }
+      task.status = 'failed';
+      await persistCodeActTask(task);
+    } else {
+      history.push({ role: 'user', content: `[用户对澄清问题的回答]\n${block}` });
+      task.waitingForUser = false;
+      task.waitingReason = undefined;
+      task.status = 'running';
+      if (pendingEventId) {
+        resolveOpenDebtsByTaskWithEvidence({ taskId: task.id, chatId: task.chatId, resolution: '用户已回答澄清，任务恢复执行', resolutionEventId: pendingEventId });
+      }
+      await persistCodeActTask(task);
+    }
+  }
+
   const stopTyping = startTypingHeartbeat(task.chatId);
   try {
-    let turnsRun = 0;
+    task.totalTurns ??= 0;
     /** Turns observed after the first successful send* — used to auto endTask. */
     let postSendTurns = 0;
-    const postSendGrace = isGoalCheck || isSelfPlay ? 0 : 1;
+    const postSendGrace = isGoalCheck || isSelfPlay ? 0 : 5;
     for (let turn = 0; turn < maxTurns && !ended && !closed; turn++) {
-      turnsRun++;
+      task.totalTurns++;
 
       // 实时干预(P1):每轮开头排一次用户 interrupt —— 原来只在续跑段开头排一次,
       // 段内 30 轮/120s 里用户喊停/问进度/补充需求全都到不了。硬停词立即终止。
@@ -745,8 +886,21 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
       if (interruptible) {
         try {
           const interrupts = await drainInterrupts(task.id);
-          if (interrupts.length > 0) {
-            if (interrupts.some((i) => isHardStop(i.text))) {
+            if (interrupts.length > 0) {
+              const hardStop = interrupts.some((i) => isHardStop(i.text));
+              const interruptResolution = hardStop ? '用户已停止该任务，债务关闭' : undefined;
+              const interruptEventId = emitTaskRuntimeEvent({
+                kind: 'user_interrupt_received',
+                taskId: task.id,
+                chatId: task.chatId,
+                cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+                turn,
+                segment,
+                ...(interruptResolution ? { resolution: interruptResolution } : {}),
+              });
+              logger.info({ taskId: task.id, chatId: task.chatId, count: interrupts.length }, 'task user interrupt received');
+
+            if (hardStop) {
               logger.info({ taskId: task.id, chatId: task.chatId, turn }, 'agent task hard-stopped by user');
               const { incrCounter } = await import('../metrics/registry.js');
               incrCounter('codeact_hardstop_total', { chat: task.chatId });
@@ -755,6 +909,14 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
                 await sendMessage(task.chatId, '好，停下了喵～（任务已取消）', task.quoteMessageIds?.[0], task.messageThreadId);
               } catch { /* ack best-effort */ }
               host.runtime.endTask('user_stopped');
+              if (task.checkpointKey) await clearCheckpoint(task.checkpointKey);
+              task.waitingForUser = false;
+              task.pendingUserInput = undefined;
+              if (interruptEventId && interruptResolution) {
+                resolveOpenDebtsByTaskWithEvidence({ taskId: task.id, chatId: task.chatId, resolution: interruptResolution, resolutionEventId: interruptEventId });
+              }
+              task.status = 'failed';
+              await persistCodeActTask(task);
               break;
             }
             const block = interrupts
@@ -762,12 +924,24 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
               .join('\n');
             history.push({
               role: 'user',
-              content: `[任务进行中，有人发来新消息]\n${block}\n先简短回应这些消息（问进度就汇报当前进度；让停就停下收尾；补充需求就纳入计划），然后继续当前任务。`,
+              content: `[任务进行中，有人发来新消息]\n${block}\n先理解这些消息是在补充事实、改变目标、询问状态、要求停止，还是普通聊天；据此调整计划或回复，然后决定是否继续当前任务。`,
             });
             injectedInterrupts = true;
             // 用户又说话了 → 任务重新有了"该回应的人",重置 sendText 后的自动收尾计数,
             // 否则模型刚 sendText 汇报过、用户追问一句,任务在回应前就被 auto_end 掐掉。
             postSendTurns = 0;
+            // Cognitive Debt：任务中途的用户补充/纠正值得记住（尤其跨段续跑时）。
+            createDebt({
+              chatId: task.chatId,
+              ownerUid: task.targetUserId,
+              taskId: task.id,
+              kind: 'correction',
+              statement: interrupts.map((i) => `${i.from}: ${i.text}`.slice(0, 200)).join('；').slice(0, 380),
+              sourceEventIds: interrupts.map((i) => `msg:${i.messageId ?? ''}`).filter((s) => s !== 'msg:'),
+              priority: 6,
+              confidence: 1,
+              ttlSec: 7 * 24 * 3600,
+            });
           }
         } catch { /* non-critical */ }
       }
@@ -787,12 +961,21 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
         } catch { /* non-critical */ }
       }
 
-      // Already delivered: don't keep burning turns waiting for a forgotten endTask.
-      if (!injectedInterrupts && host.runtime.didSendText() && postSendTurns > postSendGrace) {
+      // Intermediate messages are not task completion. Only an explicit final
+      // delivery/endTask may trigger the auto-close safety net.
+      if (!audit.hasContract() && !injectedInterrupts && host.runtime.didProduceFinal() && postSendTurns > postSendGrace) {
         host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_send');
         break;
       }
       let llmText = '';
+      emitTaskRuntimeEvent({
+        kind: 'model_turn_started',
+        taskId: task.id,
+        chatId: task.chatId,
+        cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+        turn,
+        segment,
+      });
       try {
         const result = await callWithFallback({
           usage: env().CODEACT_USAGE,
@@ -801,7 +984,26 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
           temperature: 0.7,
         });
         llmText = result.content ?? '';
+        emitTaskRuntimeEvent({
+          kind: 'model_turn_finished',
+          taskId: task.id,
+          chatId: task.chatId,
+          cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+          turn,
+          segment,
+          resultSummary: 'llm_response_received',
+        });
       } catch (err) {
+        emitTaskRuntimeEvent({
+          kind: 'model_turn_finished',
+          taskId: task.id,
+          chatId: task.chatId,
+          cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+          turn,
+          segment,
+          errorCode: 'llm_failed',
+          resultSummary: 'llm_call_failed',
+        });
         logger.warn({ err, taskId: task.id, turn }, 'CodeAct LLM failed');
         break;
       }
@@ -811,8 +1013,8 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
       history.push({ role: 'assistant', content: llmText });
       const code = extractJs(llmText);
       if (!code) {
-        if (host.runtime.didSendText()) {
-          host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_send');
+        if (!audit.hasContract() && host.runtime.didProduceFinal()) {
+          host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_final');
           break;
         }
         history.push({
@@ -835,22 +1037,28 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
       if (exec.output === 'codeact_timeout') {
         closed = true;
       }
+      // Tool results remain internal observations. The model decides whether
+      // any discovery/progress is worth telling the user via sendText.
+      if (host.runtime.isWaitingForUser()) {
+        history.push({ role: 'user', content: '[系统] 任务已进入等待用户状态，停止继续调用工具，等待下一条用户消息。' });
+        break;
+      }
       const mismatchHint = !exec.ok && /reply_to_mismatch/.test(exec.output)
         ? `\n提示：群聊 replyTo 只能是 quotes 里的 #${replyAnchor ?? '?'}（或省略让 host 填）。不要换旧 #id，也不要复用错人的气泡正文。`
         : '';
       const sentHint =
-        !ended && host.runtime.didSendText()
-          ? '\n[系统] 你已经向用户发过消息。下一动作必须是 runtime.endTask("一句话摘要")，禁止再 sendText。'
+        !ended && host.runtime.didProduceFinal()
+          ? '\n[系统] 你已经发送最终交付。下一动作必须是 runtime.endTask("一句话摘要")。'
           : '';
       history.push({
         role: 'user',
         content: exec.ok
           ? `[observation]\n${exec.output}\n${ended ? '(task ended)' : `已完成步骤 ${turn + 1}/${maxTurns}。继续下一步，或完成后 runtime.endTask("结果摘要")。`}${sentHint}`
-          : `[observation:error]\n${exec.output}${mismatchHint}\n操作失败了，分析错误原因调整策略重试，或换一种方法。${turn + 1 >= maxTurns ? (isSelfPlay ? '这是最后一轮，runtime.endTask 收尾。' : '这是最后一轮，sendText 说明进展然后 endTask。') : ''}`,
+          : `[observation:error]\n${exec.output}${mismatchHint}\n操作失败了，分析错误原因调整策略重试，或换一种方法。${turn + 1 >= maxTurns ? (isSelfPlay ? '这是最后一轮，runtime.endTask 收尾。' : '这是最后一轮，sendFinal 说明进展然后 endTask。') : ''}`,
       });
-      if (!ended && host.runtime.didSendText()) {
+      if (!audit.hasContract() && !ended && host.runtime.didProduceFinal()) {
         if (postSendTurns >= postSendGrace) {
-          host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_send');
+          host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_final');
           break;
         }
         postSendTurns += 1;
@@ -867,13 +1075,14 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
         !isGoalCheck &&
         !isSelfPlay &&
         segment + 1 < maxSegments &&
-        host.runtime.didProduce() &&
-        !host.runtime.didSendText();
+        !host.runtime.isWaitingForUser() &&
+        (audit.hasContract() || host.runtime.didProduce()) &&
+        (audit.hasContract() || !host.runtime.didProduceFinal());
 
       if (canResume) {
         let progressSummary = resumeSummary;
         try {
-          const total = (task.totalTurns ?? 0) + turnsRun;
+          const total = task.totalTurns ?? 0;
           if (total >= env().AGENT_COMPACT_AFTER_TURNS) {
             const c = await compactHistory({
               history,
@@ -896,17 +1105,25 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
           logger.warn({ err, taskId: task.id }, 'agent segment summary failed');
         }
 
+        emitTaskRuntimeEvent({
+          kind: 'checkpoint_saved',
+          taskId: task.id,
+          chatId: task.chatId,
+          segment: segment + 1,
+          turn: task.totalTurns,
+          cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+        });
         const key = await saveCheckpoint(task, {
           history,
           progressSummary,
           artifacts: [],
           segment: segment + 1,
-          totalTurns: (task.totalTurns ?? 0) + turnsRun,
+          totalTurns: task.totalTurns ?? 0,
         });
 
         task.segment = segment + 1;
         task.checkpointKey = key;
-        task.totalTurns = (task.totalTurns ?? 0) + turnsRun;
+        task.audit = audit.snapshot();
         task.status = 'queued';
         state.putTask(task);
         await persistCodeActTask(task);
@@ -927,9 +1144,39 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
           'agent task checkpointed & re-enqueued for next segment',
         );
         // 注意：不 enqueueCallback —— 任务未完成，Meta 不应收到完成回调。
-      } else if (host.runtime.didSendText()) {
-        // Model delivered but forgot endTask — synthesize so Meta gets a clean callback.
-        host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_send');
+      } else if (audit.hasContract()) {
+        host.runtime.endTask('failed_acceptance_budget_exhausted');
+      } else if (host.runtime.didProduceFinal()) {
+        // Model delivered a final message but forgot endTask — synthesize a clean callback.
+        host.runtime.endTask(isGoalCheck ? 'no_update' : 'auto_end_after_final');
+      } else if (host.runtime.isWaitingForUser()) {
+        endSummary = 'waiting_user';
+        task.waitingForUser = true;
+        task.waitingReason = host.runtime.waitingReason() ?? 'user_clarification';
+        const waitingCheckpoint = await saveCheckpoint(task, {
+          history,
+          progressSummary: resumeSummary || 'waiting for user clarification',
+          artifacts: [],
+          segment,
+          totalTurns: task.totalTurns ?? 0,
+        });
+        task.checkpointKey = waitingCheckpoint;
+        task.status = 'waiting_user';
+        // Cognitive Debt：任务挂起等待用户 = 一笔未完成认知，回答/停止时偿还。
+        createDebt({
+          chatId: task.chatId,
+          ownerUid: task.targetUserId,
+          taskId: task.id,
+          kind: 'unfinished_task',
+          statement: `任务等待用户补充信息: ${task.waitingReason}`,
+          sourceEventIds: [`task:${task.id}`],
+          priority: 7,
+          confidence: 1,
+          ttlSec: 24 * 3600,
+        });
+        state.putTask(task);
+        await persistCodeActTask(task);
+        await registerAgentChat(task.chatId, task.id);
       } else if (isSelfPlay) {
         // Self-play is private practice — never bypass maxTextSends with a failsafe DM.
         host.runtime.endTask('selfplay_silent');
@@ -971,17 +1218,67 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
         }
       }
     } else if (closed && !endSummary) {
-      endSummary = host.runtime.didSendText() ? 'timeout_after_send' : 'failed_timeout';
+      endSummary = host.runtime.didProduceFinal() ? 'timeout_after_final' : 'failed_timeout';
     }
 
     // Ensure ctx write + any fire-and-forget sends finished before Meta sees callback.
     await host.runtime.flushBookkeeping();
 
     // 续跑任务不进入终态：保持 queued，等下一段完成/超限后再收尾。
-    const resumed = endSummary.startsWith('resumed_seg');
+    const resumed = endSummary.startsWith('resumed_seg') || endSummary === 'waiting_user';
     if (!resumed) {
-      task.status = endSummary.startsWith('failed') ? 'failed' : 'done';
+      task.audit = audit.snapshot();
+      task.assessment = await audit.verify();
+      if (closed || endSummary.startsWith('failed') || endSummary === 'user_stopped') {
+        task.assessment = { status: 'unverified', reasons: ['execution_incomplete'], checks: task.assessment.checks };
+      }
+      task.status = endSummary.startsWith('failed') || endSummary === 'user_stopped' ? 'failed' : 'done';
       task.resultSummary = endSummary || 'done';
+      const terminalResolution = task.status === 'done'
+        ? `任务完成: ${String(endSummary).slice(0, 200)}`
+        : undefined;
+      const terminalEventId = emitTaskRuntimeEvent({
+        kind: task.status === 'done' ? 'task_completed' : 'task_failed',
+        taskId: task.id,
+        chatId: task.chatId,
+        cognitiveAnchorEventId: task.cognitiveAnchorEventId,
+        segment,
+        turn: task.totalTurns,
+        resultSummary: task.resultSummary,
+        ...(terminalResolution ? { resolution: terminalResolution } : {}),
+        assessmentStatus: task.assessment.status,
+      });
+      if (task.status === 'done') {
+        // 任务完成只能用这次 host 终态事件作为 resolution evidence；事件不可写时
+        // 宁可保留债务，也不回退到没有 provenance 的直接清债。
+        if (terminalEventId && terminalResolution) {
+          resolveOpenDebtsByTaskWithEvidence({
+            taskId: task.id,
+            chatId: task.chatId,
+            resolution: terminalResolution,
+            resolutionEventId: terminalEventId,
+          });
+        }
+      } else if (endSummary !== 'failed_user_stopped') {
+        // 任务失败 = 一笔未完成认知，后续可主动修复或向用户说明。
+        createDebt({
+          chatId: task.chatId,
+          ownerUid: task.targetUserId,
+          taskId: task.id,
+          kind: 'unfinished_task',
+          statement: `任务未完成: ${String(endSummary).slice(0, 300)}`,
+          sourceEventIds: terminalEventId ? [terminalEventId] : [`task:${task.id}`],
+          priority: 6,
+          confidence: 1,
+          ttlSec: 7 * 24 * 3600,
+          nextCheckInSec: 6 * 3600,
+          ...(terminalEventId ? { dedupeKey: `event-debt:${terminalEventId}:unfinished_task` } : {}),
+        });
+      }
+      saveTaskEvidence({ taskId: task.id, chatId: task.chatId, lifecycle: task.status,
+        assessment: task.assessment.status, turns: task.totalTurns ?? 0,
+        totalCalls: task.audit.totalCalls, failedCalls: task.audit.failedCalls, retryCount: task.audit.retryCount,
+        reasons: task.assessment.reasons });
       state.putTask(task);
       await persistCodeActTask(task);
       // CGM 叙事流:Subagent 终态摘要落 session_digests,成为可检索记忆。
@@ -997,23 +1294,32 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
 
       // AGI Level 5 Phase 1: 路径质量统计 + 经验验证打分(①+D)。
       // 结果好但路径脏(done + path_quality < 0.7)不算经验被证实。
-      // executor 无结构化调用历史,totalCalls=0 → 中性 0.8 分(不做证伪)。
+      // 真实 host 调用统计 + 独立验收,不能把结束当成功。
       if (injectedExperienceIds.length > 0 && env().EXPERIENCE_VERIFY_ENABLED) {
         void import('../agent/path-quality.js')
           .then(async ({ computePathQuality }) => {
-            const quality = computePathQuality({ totalCalls: 0, invalidCalls: 0, retryCount: 0, turns: task.totalTurns ?? 0 });
+            const quality = computePathQuality({ totalCalls: task.audit!.totalCalls, invalidCalls: task.audit!.failedCalls, retryCount: task.audit!.retryCount, turns: task.totalTurns ?? 0 });
             const { recordInjectOutcome } = await import('../agent/experience-verify.js');
+            const { recordSkillVerifiedUse } = await import('../agent/skills.js');
+            let skillGated = false;
+            try {
+              skillGated = env().SKILL_VERIFIED_USE_ENABLED === true;
+            } catch {
+              skillGated = false;
+            }
+            if (skillGated) recordSkillVerifiedUse(injectedSkillIds, task.assessment?.status ?? 'unverified');
             recordInjectOutcome({
               experienceIds: injectedExperienceIds,
               taskOutcome: task.status === 'done' ? 'done' : 'failed',
               pathQualityScore: quality.score,
+              evidenceStatus: task.assessment?.status ?? 'unverified',
             });
           })
           .catch((err) => logger.warn({ err, taskId: task.id }, 'experience verify failed'));
       }
 
       // AGI Level 5 Phase 4: loop 策略计数进化。
-      if (injectedPolicyIds.length > 0 && env().LOOP_POLICY_ENABLED) {
+      if (injectedPolicyIds.length > 0 && env().LOOP_POLICY_ENABLED && task.assessment.status === 'verified') {
         void import('../agent/loop-policy.js')
           .then(({ recordPolicyOutcome }) => {
             recordPolicyOutcome(injectedPolicyIds, task.status === 'done');
@@ -1027,7 +1333,7 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
           .then(({ upsertEntity }) => {
             const topic = task.contentDirection.replace(/\[goal:\d+\]/g, '').trim().slice(0, 100);
             if (topic.length >= 2) {
-              upsertEntity(topic, 'topic', { last_outcome: task.status === 'done' ? 'success' : 'failed' }, task.chatId);
+              upsertEntity(topic, 'topic', { last_outcome: task.assessment?.status ?? 'unverified' }, task.chatId);
             }
           })
           .catch((err) => logger.warn({ err, taskId: task.id }, 'world state upsert failed'));
@@ -1046,7 +1352,7 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
             distillEpisode({
               task,
               outcome: task.status === 'done' ? 'done' : 'failed',
-              progressSummary: resumeSummary ?? endSummary,
+              progressSummary: `[host assessment: ${task.assessment?.status ?? 'unverified'}; lifecycle done is not verified success] ${resumeSummary ?? endSummary}`,
               tailText,
             }),
           )
@@ -1071,14 +1377,34 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
           const achieved = endSummary.match(/^已完成[:：]\s*(.+)$/im)?.[1]?.trim();
           const cannot = endSummary.match(/^无法完成[:：]\s*(.+)$/im)?.[1]?.trim();
           void import('../agent/goals.js')
-            .then(async ({ recordCheck, markSilentChange, setGoalStatus, listGoals }) => {
+            .then(async ({ recordCheck, markSilentChange, setGoalStatus, listGoals, markGoalAchieved, recordUnverifiedCompletion }) => {
               if (achieved) {
-                // 事办完了——记录成果 + 关闭 goal。此前没这个出口：办完的 goal
-                // 永远 active 且 findings>0 永不 stale，maxActive 坑满后新 goal 全拒
-                // （2026-08-21 实测：券券补发完成两天还占坑，承诺闭环新 goal 被拒 7 次）。
-                recordCheck(goalId, `已完成: ${achieved.slice(0, 480)}`);
-                setGoalStatus(goalId, 'achieved');
-                logger.info({ goalId, result: achieved.slice(0, 80) }, 'goal achieved');
+                // Phase 2 证据门(默认 OFF 时保持 legacy 行为:直接 achieved)。
+                // 开启后:模型自称已完成 ≠ 独立验证,只有 host assessment=verified 才晋级。
+                // 未显式开启时一律 legacy,避免 mock/异常 env 下行为漂移。
+                let gated = false;
+                try {
+                  gated = env().GOAL_EVIDENCE_GATE_ENABLED === true;
+                } catch {
+                  gated = false;
+                }
+                if (!gated) {
+                  recordCheck(goalId, `已完成: ${achieved.slice(0, 480)}`);
+                  setGoalStatus(goalId, 'achieved');
+                  logger.info({ goalId, result: achieved.slice(0, 80) }, 'goal achieved (legacy, gate off)');
+                  return;
+                }
+                // 证据门：模型自称已完成 ≠ 独立验证。只有 host assessment=verified 才晋级 achieved；
+                // 否则保持 active 并计数，避免自我认证占坑或虚假关闭。
+                const evidence = task.assessment?.status ?? 'unverified';
+                if (evidence === 'verified') {
+                  recordCheck(goalId, `已完成: ${achieved.slice(0, 480)}`);
+                  markGoalAchieved(goalId, 'verified', task.assessment?.checks.map((c) => `#${c.index}:${c.reason}`).join(','));
+                  logger.info({ goalId, result: achieved.slice(0, 80) }, 'goal achieved (verified)');
+                } else {
+                  recordUnverifiedCompletion(goalId, `model completion claim without verification: ${achieved.slice(0, 200)}`);
+                  logger.info({ goalId }, 'goal completion unverified, stays active');
+                }
                 return;
               }
               if (cannot) {
@@ -1115,7 +1441,7 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
         taskId: task.id,
         chatId: task.chatId,
         summary: task.resultSummary,
-        ok: task.status === 'done',
+        ok: task.status === 'done' && (!task.acceptance || task.assessment.status === 'verified'),
         createdAt: Date.now(),
       });
     }
@@ -1126,7 +1452,7 @@ export async function runCodeActTask(task: DispatchTask): Promise<void> {
     stopTyping();
     // P1:异常逃逸路径兜底解注册(正常终态已在上面解过;续跑段不能解 ——
     // 任务还在等下一段,索引没了用户消息就退回重复 dispatch)。
-    if (interruptible && !endSummary.startsWith('resumed_seg')) {
+    if (interruptible && !endSummary.startsWith('resumed_seg') && endSummary !== 'waiting_user') {
       await unregisterAgentChat(task.chatId, task.id).catch(() => {});
     }
     try {

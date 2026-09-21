@@ -107,6 +107,27 @@ describe('decideTick', () => {
     callWithFallbackMock.mockRejectedValue(new Error('down'));
     expect((await decideTick(state)).action.type).toBe('quiet');
   });
+
+  it('includes bounded background route metadata when routing telemetry is enabled', async () => {
+    const state = {
+      hourBeijing: 14, masterSilentSec: null, masterLastText: '',
+      groups: [], dueGoals: [], rssNewCount: 0, selfPlayCooldownLeftSec: 0, lastCareAgoSec: 0,
+      cognitiveRoute: {
+        route: 'background' as const,
+        score: 0,
+        signals: [],
+        primarySignal: null,
+        reason: 'no_complexity_signal',
+        shouldUseWorkspace: true,
+      },
+    };
+    callWithFallbackMock.mockResolvedValue({ content: '{"action":"quiet","reason":"nothing"}' });
+    await decideTick(state);
+    const request = callWithFallbackMock.mock.calls[0]?.[0] as { messages?: Array<{ content?: unknown }> };
+    expect(String(request.messages?.[1]?.content)).toContain('后台认知路由：background');
+    expect(String(request.messages?.[1]?.content)).toContain('reason=no_complexity_signal');
+    expect(String(request.messages?.[1]?.content)).toContain('不授予发送、工具或 Agency 权限');
+  });
 });
 
 describe('runUnifiedTick execution mapping', () => {
@@ -207,6 +228,31 @@ describe('runUnifiedTick execution mapping', () => {
     await runUnifiedTick();
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(enqueueMock).not.toHaveBeenCalled();
+  });
+
+  it('H3.1: share parses from candidates payload', async () => {
+    const state = {
+      hourBeijing: 14, masterSilentSec: 18000, masterLastText: 'x',
+      groups: [{ chatId: -1001234567890, silentSec: 5400, lastTexts: 'AA: hi' }],
+      dueGoals: [], rssNewCount: 0, selfPlayCooldownLeftSec: 0, lastCareAgoSec: 999999,
+    };
+    callWithFallbackMock.mockResolvedValue({ content: '{"action":"share","fromChatId":-1001,"messageId":42,"toChatId":-1002,"reason":"好笑"}' });
+    const v = await decideTick(state);
+    expect(v.action.type).toBe('share');
+    if (v.action.type === 'share') {
+      expect(v.action.fromChatId).toBe(-1001);
+      expect(v.action.messageId).toBe(42);
+      expect(v.action.toChatId).toBe(-1002);
+    }
+  });
+
+  it('H3.1: share with missing ids falls back to quiet', async () => {
+    const state = {
+      hourBeijing: 14, masterSilentSec: null, masterLastText: '',
+      groups: [], dueGoals: [], rssNewCount: 0, selfPlayCooldownLeftSec: 0, lastCareAgoSec: 0,
+    };
+    callWithFallbackMock.mockResolvedValue({ content: '{"action":"share","reason":"没id"}' });
+    expect((await decideTick(state)).action.type).toBe('quiet');
   });
 
 });

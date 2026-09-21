@@ -16,9 +16,17 @@ export interface AttentionItem {
   payload?: Record<string, unknown>;
   /** Telegram forum topic (supergroup thread) id; absent for non-forum / General topic. */
   messageThreadId?: number;
+  /** Durable Telegram event used to anchor workspace/replay reads. */
+  cognitiveAnchorEventId?: string;
 }
 
+import type { AcceptanceContract, AcceptanceResult } from '../agent/task-evidence.js';
+import type { AuditSnapshot } from '../agent/execution-audit.js';
+
 export interface DispatchTask {
+  acceptance?: AcceptanceContract;
+  assessment?: AcceptanceResult;
+  audit?: AuditSnapshot;
   id: string;
   chatId: number;
   contentDirection: string;
@@ -33,8 +41,13 @@ export interface DispatchTask {
   targetUserId?: number;
   trackingKey?: string;
   createdAt: number;
-  status: 'queued' | 'running' | 'done' | 'failed';
-  /** 长时间 Agent 循环：当前是第几段（0-based）。 */
+  status: 'queued' | 'running' | 'waiting_user' | 'done' | 'failed';
+  /** Task paused after asking the user for clarification; resumes from checkpoint. */
+  waitingForUser?: boolean;
+  waitingReason?: string;
+  /** User messages received while a task is waiting; injected on resume. */
+  pendingUserInput?: Array<{ text: string; from?: string; messageId?: number; at?: number }>;
+  /** Long-running Agent loop: current segment (0-based). */
   segment?: number;
   /** checkpoint 在 Redis 里的 key；续跑时据此恢复 history。 */
   checkpointKey?: string;
@@ -43,6 +56,8 @@ export interface DispatchTask {
   resultSummary?: string;
   /** Telegram forum topic (supergroup thread) id; absent for non-forum / General topic. */
   messageThreadId?: number;
+  /** Durable Telegram event used to anchor task workspace reads. */
+  cognitiveAnchorEventId?: string;
 }
 
 export interface SubagentCallback {

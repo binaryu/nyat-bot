@@ -12,9 +12,11 @@ import { startWorker, closeWorker } from './queue/worker.js';
 import { startTaskWorker } from './queue/task-worker.js';
 import { closeQueue } from './queue/producer.js';
 import { freeEncoder } from './ai/token-counter.js';
+import { initSmartGroup } from './ai/smart-group.js';
 import { createAllowlistMiddleware } from './bot/middleware/allowlist.js';
 import { registerMemberHandler } from './bot/handlers/member.js';
 import { registerMessageHandlers } from './bot/handlers/message.js';
+import { registerFeedbackHandler } from './bot/handlers/feedback.js';
 import { createAdminApi } from './admin/api.js';
 import { createMonitorApi } from './admin/monitor.js';
 import { startCronJobs, stopCronJobs } from './cron/scheduler.js';
@@ -32,6 +34,7 @@ import {
 import { preloadSkills } from './pipeline/tools/registry.js';
 import { startMetaLoop, stopMetaLoop } from './meta/index.js';
 import { startCodeActWorker, closeCodeActWorker } from './subagent/index.js';
+import { getSandboxCapability } from './sandbox/terminal.js';
 
 async function main(): Promise<void> {
   logger.info('xxb-ts starting…');
@@ -50,6 +53,18 @@ async function main(): Promise<void> {
   // 3. Run SQLite migrations
   const appConfig = getConfig();
   runMigrations(appConfig.migrationsDir);
+
+  // Autonomous tool execution is unavailable unless the configured isolation
+  // capability is present. Keep the process alive for chat/health, but make the
+  // safety state explicit before workers start.
+  if (config.SANDBOX_ENABLED && config.SANDBOX_TERMINAL_ENABLED) {
+    const capability = getSandboxCapability();
+    if (capability.isolationRequired && !capability.bwrapAvailable) {
+      logger.error({ capability }, 'Sandbox isolation unavailable; autonomous terminal execution is blocked');
+    } else {
+      logger.info({ capability }, 'Sandbox capability verified');
+    }
+  }
 
   // 3.1 NyatDB (optional embedded engine; default off)
   try {
@@ -96,6 +111,8 @@ async function main(): Promise<void> {
   // 7.5 Register message handler (AFTER allowlist middleware so it takes effect)
   registerMessageHandlers(bot);
 
+  registerFeedbackHandler();
+
   const ownership = getStartupOwnership();
 
   // 8. Start BullMQ worker
@@ -135,6 +152,8 @@ async function main(): Promise<void> {
       }
       logger.info({ url: config.WEBHOOK_URL }, 'Webhook set (failover mode)');
       startIngressWatchdog(redis, 'webhook');
+      // Smart Group: 同 polling 分支,webhook 模式也恢复历史健康数据
+      await initSmartGroup();
     } else {
       // ── Polling mode (preferred / default) ──
       if (ingressMode === 'webhook' && !canWebhook) {
@@ -148,8 +167,17 @@ async function main(): Promise<void> {
         logger.warn({ err }, 'deleteWebhook before polling failed (continuing)');
       }
       installPollHeartbeat(bot, redis);
+      // Smart Group: 从 Redis 恢复历史健康数据(重启不丢,auto-assign 首日就有据可依)。
+      // 内部 SMART_GROUP_ENABLED=false 时 no-op。
+      await initSmartGroup();
       void bot.start({
         onStart: () => logger.info('Bot started (polling)'),
+        // message_reaction 默认不推送（grammY 文档），显式开——feedback 回流靠它收 reward。
+        allowed_updates: [
+          'message', 'edited_message', 'channel_post', 'edited_channel_post',
+          'message_reaction', 'message_reaction_count',
+          'callback_query', 'inline_query', 'my_chat_member', 'chat_member',
+        ],
       });
       startIngressWatchdog(redis, 'polling');
     }
@@ -193,18 +221,16 @@ async function main(): Promise<void> {
     app.get('/metrics', (c) => c.text(renderMetrics()));
     logger.info('Prometheus /metrics enabled');
   }
-  app.get('/miniapp', (c) => c.redirect('/miniapp/'));
-  app.use('/miniapp/*', serveStatic({ root: './' }));
-
-  // Mount admin API at /miniapp_api
+  // Mount admin API at /miniapp_api (kept: allowlist review console posts here;
+  // the miniapp *frontend* is gone, allowlist ops moved to the bot DM flow)
   const adminApi = createAdminApi({
     redis,
     bot,
     config: allowlistConfig,
     env: config,
     aiCall: callAllowlistReviewModel,
-    // 2026-08-20 补上：之前没传 → miniapp 时代 AI 审核拉不到最近群消息，
-    // 大量「无法获取群组数据，建议人工审核」就是这么来的。
+    // 2026-08-20: without this the AI review can't fetch recent group messages,
+    // producing waves of "no group data, suggest manual review".
     getRecentContext: defaultGetRecentContext,
   });
   app.route('/miniapp_api', adminApi);

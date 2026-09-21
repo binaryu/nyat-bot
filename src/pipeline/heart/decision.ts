@@ -47,6 +47,8 @@ export interface HeartInput {
   lastSpokeSecAgo?: number;
   /** 连发提示(G4):★ 锚点是一波 N 条连发的末尾,整体评估 */
   burstNote?: string;
+  /** Optional bounded scoped workspace block for the V2 rollout. */
+  cognitiveWorkspaceHint?: string;
   signal?: AbortSignal;
 }
 
@@ -157,7 +159,10 @@ async function _heartDecision(input: HeartInput): Promise<HeartDecision> {
     ? `\n(你 ${Math.round(input.lastSpokeSecAgo)} 秒前刚在这个群说过话,正处于对话中)`
     : '';
   const burstLine = input.burstNote ? `\n${input.burstNote}` : '';
-  const userMsg = `[群聊上下文]\n${ctxStr}${presence}${burstLine}\n\n对 ★ 标记的最新消息做出你的决定,输出 JSON。`;
+  const workspaceLine = input.cognitiveWorkspaceHint?.trim()
+    ? `\n\n${input.cognitiveWorkspaceHint.trim().slice(0, 3000)}`
+    : '';
+  const userMsg = `[群聊上下文]\n${ctxStr}${presence}${burstLine}${workspaceLine}\n\n对 ★ 标记的最新消息做出你的决定,输出 JSON。`;
 
   let raw: string;
   try {
@@ -232,7 +237,11 @@ async function _heartDecision(input: HeartInput): Promise<HeartDecision> {
   }
   const latencyMs = Math.round(performance.now() - start);
   if (!parsed) {
-    logger.warn({ chatId: input.chatId, rawSummary: summarizeHeartRaw(raw) }, 'heart parse failed, fail-closed pass');
+    // H0 hybrid fail-soft:parse 失败 ≠ 没听懂。旧行为 fail-closed pass 直接吞回复,
+    // 与 llm_failed 的 defer/judge 兜底不对称 —— 同一条消息因"吐脏 JSON"还是
+    // "链路挂了"走不同命运。parse_failed 进同一条 hybrid 路径:defer 预算内重评,
+    // 预算耗尽回退 legacy judge(与 llm_failed 同链,同日志前缀)。
+    logger.warn({ chatId: input.chatId, rawSummary: summarizeHeartRaw(raw) }, 'heart parse failed, hybrid fallback');
     return { act: 'pass', path: 'chat', why: 'parse_failed', latencyMs, judgeResult: toJudgeResult('pass', 'chat', latencyMs) };
   }
 

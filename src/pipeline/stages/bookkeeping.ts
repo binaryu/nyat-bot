@@ -17,11 +17,13 @@ import { recordUserMessage } from "../../tracking/user-profile.js";
 import { memorizeMessage } from "../../memory/chroma.js";
 import { maybeReact } from "../reactions.js";
 import { recordInteraction } from "../../tracking/social-graph.js";
+import { recordSocialInteraction } from "../../agent/social-event-graph.js";
 import { getRedis } from "../../db/redis.js";
 import { callWithFallback } from "../../ai/fallback.js";
 import { getBotUid } from "../../bot/bot.js";
 import { env } from "../../env.js";
 import { logger } from "../../shared/logger.js";
+import { appendTelegramMessageEvent } from "../../agent/cognitive-events.js";
 import { recordMessage as recordStatMessage } from "../../tracking/stats.js";
 import { bumpGatePendingCount } from "../timing/state-store.js";
 import { playGame, hasActiveGame } from "../games/manager.js";
@@ -30,6 +32,7 @@ import { sender } from "../shared.js";
 export interface BookkeepingResult {
   shouldAbort: boolean;
   reason?: string;
+  cognitiveAnchorEventId?: string;
 }
 
 export async function runBookkeeping(ctx: {
@@ -45,6 +48,23 @@ export async function runBookkeeping(ctx: {
 }): Promise<BookkeepingResult> {
   const { formatted, job, botUid, botIdentity, isDenoiseBot, timings } = ctx;
   const e = env();
+  let cognitiveAnchorEventId: string | undefined;
+
+  // The Telegram ingress already records this event asynchronously. Repeating
+  // the append here is intentional: direct/legacy callers also get a durable
+  // anchor, while the shared dedupe key returns the original event when the
+  // ingress write won the race. Facts remain metadata-only.
+  try {
+    cognitiveAnchorEventId = appendTelegramMessageEvent({
+      update: job.update,
+      chatId: ctx.chatId,
+      messageId: formatted.messageId,
+      ...(!formatted.isAnonymous && formatted.uid > 0 ? { userId: formatted.uid } : {}),
+      occurredAt: formatted.timestamp,
+    });
+  } catch (err) {
+    logger.debug({ err, chatId: ctx.chatId, messageId: formatted.messageId }, 'cognitive message anchor failed (non-critical)');
+  }
 
   // 3. Save to context
   const t2 = performance.now();
@@ -73,7 +93,18 @@ export async function runBookkeeping(ctx: {
   if (job.chatId < 0 && !formatted.isBot && formatted.replyTo) {
     const r = formatted.replyTo;
     if (r.uid && r.uid !== formatted.uid && r.uid !== getBotUid()) {
-      try { recordInteraction(job.chatId, formatted.uid, formatted.fullName, r.uid, r.fullName); }
+      try {
+        recordInteraction(job.chatId, formatted.uid, formatted.fullName, r.uid, r.fullName);
+        recordSocialInteraction({
+          chatId: job.chatId,
+          fromUid: formatted.uid,
+          toUid: r.uid,
+          kind: 'reply',
+          messageId: formatted.messageId,
+          occurredAt: formatted.timestamp,
+          correlationId: `telegram:${job.chatId}:social:${formatted.messageId}`,
+        });
+      }
       catch { /* non-critical */ }
     }
   }
@@ -114,14 +145,13 @@ export async function runBookkeeping(ctx: {
     }).catch((err) => logger.debug({ err }, 'Onboarding check failed (non-critical)'));
   }
 
-  // 3.345 DM 好感(功能 B):记录私聊过(供睡前/起床 DM 资格)+ 停 @催pm +
+  // 3.345 DM 好感(功能 B):记录私聊过(供睡前/起床 DM 资格)+
   // flush 攒着的话。全程 fire-and-forget,不阻塞管线;flush 仅在有攒话时动工。
   if (job.chatId > 0 && !formatted.isBot) {
     void (async () => {
       try {
-        const { markDmEver, markPmDmOpen } = await import('../../tracking/dm-state.js');
+        const { markDmEver } = await import('../../tracking/dm-state.js');
         markDmEver(formatted.uid);
-        markPmDmOpen(formatted.uid);
         const { countDmPending } = await import('../../tracking/dm-pending.js');
         if (countDmPending(formatted.uid) > 0) {
           const { flushDmPendingOnInbound } = await import('../dm-proactive.js');
@@ -143,7 +173,7 @@ export async function runBookkeeping(ctx: {
         "🔐 你正在进行入群验证，请先回答验证问题。验证完成后才能继续对话喵~",
         formatted.messageId,
       );
-      return { shouldAbort: true, reason: "verification intercept" };
+      return { shouldAbort: true, reason: "verification intercept", cognitiveAnchorEventId };
     }
   }
 
@@ -161,6 +191,15 @@ export async function runBookkeeping(ctx: {
   // 3.51 Stats (fire-and-forget)
   if (!formatted.isBot) {
     try { recordStatMessage(job.chatId, formatted.uid); } catch (err) { logger.debug({ err, chatId: job.chatId }, 'recordStatMessage failed'); }
+    // Phase 14.1: DM 按天聚合(风险输入)。只在 DM + flag 开时记,群聊零开销。
+    // 同步 SQLite UPSERT(<1ms),fail-soft。
+    if (job.chatId > 0 && e.REVERSE_VALVE_ENABLED) {
+      try {
+        const { recordDmMessage } = await import('../../agent/reverse-valve.js');
+        // formatted.timestamp 是 Telegram 秒级时间戳;recordDmMessage 按秒计深夜时段。
+        recordDmMessage(formatted.uid, formatted.textContent || formatted.captionContent || '', formatted.timestamp);
+      } catch (err) { logger.debug({ err, chatId: job.chatId }, 'dm stats record failed (non-critical)'); }
+    }
   }
 
   // 3.6 Bot interaction tracking(D 降噪:ad/verify/echo 不进 digest/学习)
@@ -224,9 +263,9 @@ export async function runBookkeeping(ctx: {
     const gameResult = playGame(job.chatId, formatted.uid, formatted.textContent || "");
     if (gameResult) {
       await sender.sendDirect(job.chatId, gameResult, formatted.messageId);
-      return { shouldAbort: true, reason: "game input interception" };
+      return { shouldAbort: true, reason: "game input interception", cognitiveAnchorEventId };
     }
   }
 
-  return { shouldAbort: false };
+  return { shouldAbort: false, cognitiveAnchorEventId };
 }

@@ -35,6 +35,10 @@ import { clearSleepPending, pushSleepPending } from "../../tracking/sleep-queue.
 import { getBotDisplayName } from "../../bot/bot.js";
 import { AIError } from "../../shared/errors.js";
 import { needsLookup } from "../heart/path-heuristic.js";
+import { classifyCognitiveRoute, shouldApplyCognitiveRoute, type CognitiveRoutingDecision } from "../../agent/cognitive-routing.js";
+import { incrCounter } from "../../metrics/registry.js";
+import { dispatchWaitViaAgency } from "../../agent/agency-wait-dispatch.js";
+import { recordCognitiveRouteDecision } from "../../agent/cognitive-route-observations.js";
 
 export interface PostJudgeResult {
   /** true = pipeline should return (no reply or reply already sent) */
@@ -82,6 +86,44 @@ export async function runPostJudge(ctx: {
       ? await applyChatPathPolicy({ chatId: job.chatId, message: formatted, botUid, rawReplyPath })
       : { replyPath: rawReplyPath ?? "direct", matchedPatterns: [], source: "raw" as const };
   const effectiveReplyPath: ReplyPath = pathPolicyDecision.replyPath;
+
+  let cognitiveRouting: CognitiveRoutingDecision | undefined;
+  let applyCognitiveRoute = false;
+  let cognitiveRouteObservationId: number | undefined;
+  // Phase 8: classify complexity after the existing judge/path decision.
+  // Telemetry is shadow-only by default; the separate behavior flag can only
+  // request the already-scoped workspace and never grants action authority.
+  if (e.COGNITIVE_ROUTING_ENABLED || e.COGNITIVE_ROUTING_BEHAVIOR_ENABLED) {
+    const routing = classifyCognitiveRoute({
+      text: formatted.textContent || formatted.captionContent || '',
+      action: judgeResult.action,
+      replyPath: effectiveReplyPath,
+      judgeRule: judgeResult.rule,
+      pendingTask: Boolean(job.turnContext?.obligationId),
+      taskRecovery: Boolean(job.turnContext?.isReplan || job.turnContext?.isWaitReplay),
+    });
+    cognitiveRouting = routing;
+    applyCognitiveRoute = shouldApplyCognitiveRoute(routing, {
+      enabled: e.COGNITIVE_ROUTING_BEHAVIOR_ENABLED,
+      chatIds: e.COGNITIVE_ROUTING_CHAT_IDS,
+    }, job.chatId);
+    if (e.COGNITIVE_ROUTING_ENABLED) {
+      incrCounter('cognitive_route_total', {
+        route: routing.route,
+        trigger: routing.primarySignal ?? 'none',
+      });
+    }
+    logger.debug(
+      {
+        chatId: job.chatId,
+        messageId: formatted.messageId,
+        route: routing.route,
+        score: routing.score,
+        signals: routing.signals,
+      },
+      'Cognitive route shadow',
+    );
+  }
 
   logger.debug(
     {
@@ -158,7 +200,9 @@ export async function runPostJudge(ctx: {
         const queued = await pushSleepPending(job.chatId, {
           entry: {
             update: job.update, chatId: job.chatId, messageId: formatted.messageId,
-            enqueuedAt: job.enqueuedAt, waitReplay: true, sleepCatchup: true,
+            enqueuedAt: job.enqueuedAt,
+            cognitiveAnchorEventId: job.cognitiveAnchorEventId,
+            waitReplay: true, sleepCatchup: true,
           },
           rule: judgeResult.rule,
           ts: Date.now(),
@@ -252,6 +296,7 @@ export async function runPostJudge(ctx: {
               chatId: job.chatId,
               messageId: formatted.messageId,
               enqueuedAt: job.enqueuedAt,
+              cognitiveAnchorEventId: job.cognitiveAnchorEventId,
               waitReplay: true,
               obligationId: job.turnContext?.obligationId,
               obligationTargetUid: job.turnContext?.obligationTargetUid,
@@ -263,13 +308,33 @@ export async function runPostJudge(ctx: {
           logger.warn({ err, chatId: job.chatId }, "setWaitAnchor failed (wait will be silence-only)");
         }
       }
-      await transitionToWait(
-        job.chatId,
-        waitSecBounded,
-        formatted.messageId,
-        formatted.uid,
-        job.turnContext?.obligationId,
-      );
+      const agencyWait = await dispatchWaitViaAgency({
+        chatId: job.chatId,
+        triggerMessageId: formatted.messageId,
+        ...(formatted.uid > 0 ? { triggerUserId: formatted.uid } : {}),
+        waitSec: waitSecBounded,
+        reason: `pipeline_gate:${gateDecision.reason}`,
+        source: 'pipeline_gate',
+        ...(job.turnContext?.obligationId ? { obligationId: job.turnContext.obligationId } : {}),
+        ...(job.cognitiveAnchorEventId ? { cognitiveAnchorEventId: job.cognitiveAnchorEventId } : {}),
+      });
+      if (agencyWait.attempted) {
+        if (!agencyWait.accepted) {
+          logger.warn(
+            { chatId: job.chatId, messageId: formatted.messageId, agencyRunId: agencyWait.agencyRunId, reason: agencyWait.reason },
+            "Pipeline gate wait rejected by Agency authority transport",
+          );
+          return { completed: true };
+        }
+      } else {
+        await transitionToWait(
+          job.chatId,
+          waitSecBounded,
+          formatted.messageId,
+          formatted.uid,
+          job.turnContext?.obligationId,
+        );
+      }
       const totalMs = Math.round(performance.now() - start);
         logger.info(
           { chatId: job.chatId, totalMs, waitSec: gateDecision.waitSec, reason: gateDecision.reason, triggerUid: formatted.uid, timings },
@@ -354,11 +419,62 @@ export async function runPostJudge(ctx: {
       await recordGateContinue(job.chatId);
       await transitionToRunning(job.chatId);
     }
+  } else if (e.FLOOR_ENABLED && !job.turnContext?.gateBypass) {
+    // H1.2 silence 收敛(无 gate 时的确定性沉默层):gate LLM 关着的群,
+    // 用 0ms 本地三律代替 —— self_chase/hot_lurk/dead_chat 直接落库返回,
+    // 不烧 judge/reply。点名(@/回复bot/私聊)永不沉默;to_me 强义务豁免。
+    // replan/waitReplay 不走这里(上面 G3 分支已跳过 judge)。
+    const isDirect = !!(judgeResult.rule && DIRECT_INTERACTION_RULES.has(judgeResult.rule));
+    if (!isDirect && judgeResult.action === "REPLY" && job.chatId < 0) {
+      try {
+        const { shouldStaySilent } = await import("../rhythm/silence.js");
+        const { getChatState } = await import("../timing/chat-runtime.js");
+        const tstate = await getChatState(job.chatId).catch(() => undefined);
+        const nowMs = Date.now();
+        const nowSec = Math.floor(nowMs / 1000);
+        const addressed = judgeResult.rule === "reply_to_self" || judgeResult.rule === "mention_self";
+        const strongObligation = !!job.turnContext?.obligationStrong;
+        if (!addressed && !strongObligation) {
+          const s = shouldStaySilent({
+            recentMessages: recentMessages.map((m) => ({ uid: m.uid, timestamp: m.timestamp })),
+            botUid,
+            nowMs,
+            lastBotReplyAtMs: tstate?.lastBotReplyAt,
+            messagesLast1Min: recentMessages.filter((m) => m.timestamp >= nowSec - 60).length,
+            addressedToBot: false,
+          });
+          if (s.silent) {
+            const totalMs = Math.round(performance.now() - start);
+            logger.info(
+              { chatId: job.chatId, messageId: formatted.messageId, reason: s.reason, totalMs },
+              "Pipeline complete (silence: stayed quiet, context saved)",
+            );
+            return { completed: true };
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, chatId: job.chatId }, "silence check failed (non-critical, fall through)");
+      }
+    }
   }
 
   // 5.5-5.7 Post-mute-gate intercepts
   if (await tryPostMuteIntercepts(job.chatId, formatted, judgeResult)) {
     return { completed: true };
+  }
+
+  // Only create a cost/quality sample for turns that reach reply generation.
+  // Gate drops, mute intercepts, and silence-only paths otherwise leave an
+  // observation permanently stuck in the classified state.
+  if (cognitiveRouting) {
+    cognitiveRouteObservationId = recordCognitiveRouteDecision({
+      chatId: job.chatId,
+      triggerMessageId: formatted.messageId,
+      route: cognitiveRouting.route,
+      score: cognitiveRouting.score,
+      primarySignal: cognitiveRouting.primarySignal,
+      behaviorApplied: applyCognitiveRoute,
+    });
   }
 
   await releaseHeldChatLock();
@@ -368,6 +484,9 @@ export async function runPostJudge(ctx: {
     job, formatted, judgeResult, botUid,
     effectiveReplyPath,
     e, start, timings, lockState, releaseHeldChatLock,
+    useCognitiveWorkspace: applyCognitiveRoute,
+    cognitiveRoute: applyCognitiveRoute ? cognitiveRouting?.route : undefined,
+    cognitiveRouteObservationId,
   });
 
   return { completed: true };

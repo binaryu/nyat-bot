@@ -1,9 +1,74 @@
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { env } from '../env.js';
 import { resolveSandboxRoot } from './paths.js';
 import { logger } from '../shared/logger.js';
 
 const MAX_OUTPUT = 4000;
+
+// ── 真隔离: bwrap userns 沙盒(Phase 15) ──
+// executeCommand 默认走 bwrap: 与宿主隔离 mount/user/pid/net(无 lo 外网,
+// 保留回环做本地 DNS 兜底),cwd=data/sandbox 以读写绑定,PATH/SSL 只读绑定。
+// 隔离能力缺失或启动失败时默认拒绝执行；只有明确关闭
+// SANDBOX_REQUIRE_ISOLATION 才允许应急宿主回退。
+const BWRAP_BIN = '/usr/bin/bwrap';
+let bwrapMissingLogged = false;
+
+function bwrapAvailable(): boolean {
+  // SANDBOX_BWRAP_ENABLED 只代表 bwrap 是否参与，回退策略由
+  // SANDBOX_REQUIRE_ISOLATION 单独控制。
+  try {
+    if (!env().SANDBOX_BWRAP_ENABLED) return false;
+  } catch { return true; }
+  if (existsSync(BWRAP_BIN)) return true;
+  if (!bwrapMissingLogged) {
+    bwrapMissingLogged = true;
+    logger.warn('sandbox: bwrap binary missing, isolation unavailable');
+  }
+  return false;
+}
+
+interface BwrapSpec {
+  bin: string;
+  args: string[];
+  cwd: string;
+  timeoutMs: number;
+}
+
+/** 构造 bwrap 启动参数: 命令走 /bin/sh -c(沙盒内), 环境只给最小集。
+ * 关键: 不绑定宿主 / 等敏感目录 —— 沙盒内 / 只有绑进去的系统目录,
+ * /root/.env 等一律不可见。cwd 是唯一可写绑定; 沙盒内 chdir 到 /sandbox。
+ */
+export function buildBwrapSpec(command: string, cwd: string, timeoutMs: number): BwrapSpec {
+  const pathEnv = process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin';
+  return {
+    bin: BWRAP_BIN,
+    args: [
+      '--unshare-all',       // user/mount/pid/net/ipc/uts 全隔离
+      '--die-with-parent',   // bot 崩了不留孤儿进程
+      '--ro-bind', '/usr', '/usr',
+      '--ro-bind-try', '/usr/local', '/usr/local',
+      '--ro-bind', '/bin', '/bin',
+      '--ro-bind', '/lib', '/lib',
+      '--ro-bind', '/lib64', '/lib64',
+      '--ro-bind-try', '/etc/ssl', '/etc/ssl',
+      '--ro-bind-try', '/etc/ca-certificates', '/etc/ca-certificates',
+      '--ro-bind-try', '/etc/resolv.conf', '/etc/resolv.conf',
+      '--bind', cwd, '/sandbox', // 唯一可写绑定, 沙盒内固定 /sandbox
+      '--dir', '/tmp',
+      '--tmpfs', '/run',
+      '--proc', '/proc',
+      '--dev', '/dev',
+      '--chdir', '/sandbox',
+      '--setenv', 'PATH', pathEnv,
+      '--setenv', 'HOME', '/sandbox',
+      '--setenv', 'LANG', 'en_US.UTF-8',
+      '--', '/bin/sh', '-c', command,
+    ],
+    cwd,
+    timeoutMs,
+  };
+}
 
 /**
  * P1 fix(2026-08-22 审查): 原实现是子串匹配——`rm -rf` 拦不住 `rm -r -f`/`rm -fr`/
@@ -68,6 +133,35 @@ export interface CommandResult {
   durationMs: number;
 }
 
+export interface SandboxCapability {
+  terminalEnabled: boolean;
+  bwrapEnabled: boolean;
+  isolationRequired: boolean;
+  bwrapBinary: string;
+  bwrapAvailable: boolean;
+  reason?: string;
+}
+
+/** Synchronous capability check for health/admin surfaces. */
+export function getSandboxCapability(): SandboxCapability {
+  const configuration = env();
+  const bwrapEnabled = configuration.SANDBOX_BWRAP_ENABLED;
+  const available = bwrapEnabled && existsSync(BWRAP_BIN);
+  return {
+    terminalEnabled: configuration.SANDBOX_TERMINAL_ENABLED,
+    bwrapEnabled,
+    isolationRequired: configuration.SANDBOX_REQUIRE_ISOLATION !== false,
+    bwrapBinary: BWRAP_BIN,
+    bwrapAvailable: available,
+    ...(available ? {} : { reason: bwrapEnabled ? 'bwrap binary missing' : 'bwrap disabled by configuration' }),
+  };
+}
+
+function isolationUnavailable(cwd: string, start: number, reason: string): CommandResult {
+  logger.warn({ cwd, reason }, 'sandbox terminal: isolation unavailable, command denied');
+  return { stdout: '', stderr: `sandbox isolation unavailable: ${reason}`, exitCode: -1, durationMs: Date.now() - start };
+}
+
 export function executeCommand(command: string, opts?: { timeoutMs?: number }): Promise<CommandResult> {
   const timeoutMs = opts?.timeoutMs ?? env().CODEACT_TIMEOUT_MS;
   if (!env().SANDBOX_TERMINAL_ENABLED) {
@@ -79,6 +173,43 @@ export function executeCommand(command: string, opts?: { timeoutMs?: number }): 
   }
   const cwd = resolveSandboxRoot();
   const start = Date.now();
+  const requireIsolation = env().SANDBOX_REQUIRE_ISOLATION !== false;
+  // 真隔离优先: bwrap 沙盒内执行。不可用时默认 fail-closed。
+  if (bwrapAvailable()) {
+    const spec = buildBwrapSpec(command, cwd, timeoutMs);
+    return new Promise((resolve) => {
+      const proc = execFile(spec.bin, spec.args, {
+        cwd: spec.cwd,
+        timeout: spec.timeoutMs,
+        maxBuffer: 1024 * 1024,
+      }, (err, stdout, stderr) => {
+        const durationMs = Date.now() - start;
+        if (err && (err as NodeJS.ErrnoException & { killed?: boolean }).killed) {
+          resolve({ stdout: truncate(stdout), stderr: truncate(stderr) + '\n(timeout)', exitCode: -1, durationMs });
+        } else if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+          if (requireIsolation) resolve(isolationUnavailable(cwd, start, 'bwrap disappeared before spawn'));
+          else {
+            logger.warn('sandbox: bwrap spawn ENOENT, emergency host fallback enabled');
+            resolve(hostExec(command, cwd, timeoutMs, start));
+          }
+        } else {
+          const failure = err ? `sandbox isolation failed: ${truncate(stderr || err.message)}` : truncate(stderr);
+          resolve({ stdout: truncate(stdout), stderr: failure, exitCode: (err as { code?: number } | null)?.code ?? 0, durationMs });
+        }
+      });
+      proc.on('error', (err) => {
+        if (requireIsolation) resolve(isolationUnavailable(cwd, start, err.message || 'bwrap spawn error'));
+        else resolve(hostExec(command, cwd, timeoutMs, start));
+      });
+    });
+  }
+  if (requireIsolation) return Promise.resolve(isolationUnavailable(cwd, start, env().SANDBOX_BWRAP_ENABLED ? 'bwrap unavailable' : 'bwrap disabled'));
+  logger.warn('sandbox: emergency host fallback enabled (SANDBOX_REQUIRE_ISOLATION=false)');
+  return hostExec(command, cwd, timeoutMs, start);
+}
+
+/** Emergency-only host exec (no isolation). */
+function hostExec(command: string, cwd: string, timeoutMs: number, start: number): Promise<CommandResult> {
   return new Promise((resolve) => {
     const proc = exec(command, {
       cwd,

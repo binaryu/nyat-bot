@@ -27,9 +27,26 @@ export interface DistillResult {
 export function parseDistillOutput(raw: string): DistillResult | null {
   try {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-    const m = cleaned.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    const obj = JSON.parse(m[0]) as Record<string, unknown>;
+    const candidates = [
+      cleaned,
+      cleaned.replace(/,\s*([}\]])/g, '$1'),
+      cleaned.match(/\{[\s\S]*\}/)?.[0] ?? '',
+      (cleaned.match(/\{[\s\S]*\}/)?.[0] ?? '').replace(/,\s*([}\]])/g, '$1'),
+    ];
+    let obj: Record<string, unknown> | null = null;
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      try {
+        const parsed = JSON.parse(candidate) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          obj = parsed as Record<string, unknown>;
+          break;
+        }
+      } catch {
+        // Try the next common LLM formatting variant.
+      }
+    }
+    if (!obj) return null;
     const summary = typeof obj['summary'] === 'string' ? (obj['summary'] as string).trim().slice(0, 2000) : '';
     if (!summary) return null;
     const strArr = (v: unknown, max: number, len: number): string[] =>
@@ -78,11 +95,14 @@ export interface DistillEpisodeArgs {
  */
 export async function distillEpisode(args: DistillEpisodeArgs): Promise<DistillResult | null> {
   const { task, outcome, progressSummary, tailText } = args;
+  // Evidence gate: lifecycle done without host verification must not be distilled as success.
+  const assessed: 'done' | 'failed' =
+    outcome === 'done' && task.assessment?.status === 'verified' ? 'done' : 'failed';
   try {
     const system = loadCachedPrompt('task/distill.md');
     const user = [
       `goal: ${task.contentDirection.slice(0, 500)}`,
-      `outcome: ${outcome}`,
+      `outcome: ${assessed}`,
       `summary: ${progressSummary.slice(0, 2000)}`,
       `turns: ${task.totalTurns ?? 0}, segments: ${(task.segment ?? 0) + 1}`,
       ``,
@@ -122,7 +142,7 @@ export async function distillEpisode(args: DistillEpisodeArgs): Promise<DistillR
       taskId: task.id,
       chatId: task.chatId,
       goal: task.contentDirection,
-      outcome,
+      outcome: assessed,
       summary: parsed.summary,
       lessons: parsed.lessons,
       tags: parsed.tags,
@@ -131,6 +151,10 @@ export async function distillEpisode(args: DistillEpisodeArgs): Promise<DistillR
     });
 
     if (episodeId !== null && parsed.experience.length > 0) {
+      // P3-1 血缘:记录产出 episode 的 assessed outcome + host assessment。
+      // skill-distill 只读 source_assessment='verified' 的经验 —— unverified 经验
+      // 仍保留在库(可检索),但永不进入技能蒸馏素材。
+      const srcAssessment = task.assessment?.status ?? 'unverified';
       saveExperienceEntries(
         parsed.experience.map((e) => ({
           kind: e.kind,
@@ -138,6 +162,8 @@ export async function distillEpisode(args: DistillEpisodeArgs): Promise<DistillR
           tags: e.tags,
           sourceEpisodeId: episodeId,
           originBot: env().BOT_USERNAME ?? 'self',
+          sourceOutcome: assessed,
+          sourceAssessment: srcAssessment === 'verified' ? 'verified' : srcAssessment === 'failed' ? 'failed' : 'unverified',
         })),
       );
       pruneExperience(200);

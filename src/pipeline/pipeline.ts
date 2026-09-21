@@ -7,7 +7,7 @@ import { formatMessage } from "./formatter.js";
 import { getRecent } from "./context/manager.js";
 import { judge, l0Rule } from "./judge/judge.js";
 import { isMentioningSelf } from "./judge/rules.js";
-import { tryCreateResearchTask } from "./judge/task-trigger.js";
+import { tryCreateResearchTask, handleTaskFollowUp } from "./judge/task-trigger.js";
 import { processMedia } from "./stages/media.js";
 import { runBookkeeping } from "./stages/bookkeeping.js";
 import { runPostJudge } from "./stages/post-judge.js";
@@ -25,6 +25,8 @@ import { hasDmEver } from "../tracking/dm-state.js";
 import { isMaster } from "../admin/auth.js";
 import { pushSleepPending } from "../tracking/sleep-queue.js";
 import { runHeartBranch } from "./heart/heart.js";
+import { classifyAddressee } from "./floor/addressee.js";
+import { recordFloorDecision } from "./floor/store.js";
 
 // ── Main pipeline orchestrator ──────────────────────────────────────
 
@@ -133,6 +135,10 @@ export async function processPipeline(job: ChatJob): Promise<void> {
         timings,
         job,
       });
+      if (bkResult.cognitiveAnchorEventId) {
+        job.cognitiveAnchorEventId = bkResult.cognitiveAnchorEventId;
+        if (job.turnContext) job.turnContext.cognitiveAnchorEventId = bkResult.cognitiveAnchorEventId;
+      }
       if (bkResult?.shouldAbort) {
         logger.debug({ chatId: job.chatId, reason: bkResult.reason }, "Pipeline complete (bookkeeping intercept)");
         return;
@@ -247,7 +253,9 @@ export async function processPipeline(job: ChatJob): Promise<void> {
         const queued = await pushSleepPending(job.chatId, {
           entry: {
             update: job.update, chatId: job.chatId, messageId: formatted.messageId,
-            enqueuedAt: job.enqueuedAt, waitReplay: true, sleepCatchup: true,
+            enqueuedAt: job.enqueuedAt,
+            cognitiveAnchorEventId: job.cognitiveAnchorEventId,
+            waitReplay: true, sleepCatchup: true,
           },
           rule: l0?.rule,
           ts: Date.now(),
@@ -323,6 +331,17 @@ export async function processPipeline(job: ChatJob): Promise<void> {
         botIdentity.nicknames,
       );
       if (mentioned) {
+        // Phase 13.5: 关联闭环优先于新建 —— 对进行中任务的追问/催促/取消
+        // 先处理(同样要求 @,同样 L0 零成本)。新建任务意图在其内部让路。
+        const followed = await handleTaskFollowUp(
+          job.chatId, formatted.uid,
+          formatted.textContent || formatted.captionContent || '',
+          true,
+        );
+        if (followed) {
+          logger.info({ chatId: job.chatId, uid: formatted.uid }, 'Pipeline complete (task follow-up, judge skipped)');
+          return;
+        }
         const taken = await tryCreateResearchTask(
           job.chatId, formatted.uid,
           formatted.textContent || formatted.captionContent || '',
@@ -332,6 +351,38 @@ export async function processPipeline(job: ChatJob): Promise<void> {
           logger.info({ chatId: job.chatId, uid: formatted.uid }, 'Pipeline complete (task created, judge skipped)');
           return;
         }
+      }
+    }
+
+    // H1.1 floor/addressee 三档(默认 OFF,OFF = 零行为变化)。
+    // 开后:每条群消息先 0ms 分类 + 落库 floor_decisions;
+    // ambient → bookkeeping 已做,直接落库返回(省 judge token);
+    // not_me → 同 ambient,但 reason 区分(duet/forwarded/bot_message);
+    // to_me / to_other → 走原 judge 链(Heart LLM 看全文自己决断)。
+    // 注意:to_other 不短路 —— 只是不找我,不代表不值得听(Heart 会判)。
+    if (e.FLOOR_ENABLED && job.chatId < 0 && !formatted.isBot) {
+      try {
+        const addr = classifyAddressee(
+          formatted, recentMessages, botUid,
+          botIdentity.username, botIdentity.nicknames, job.chatId,
+        );
+        recordFloorDecision({
+          chatId: job.chatId, messageId: formatted.messageId,
+          verdict: addr.verdict, reason: addr.reason,
+        });
+        logger.debug(
+          { chatId: job.chatId, messageId: formatted.messageId, verdict: addr.verdict, reason: addr.reason },
+          "Floor: addressee classified",
+        );
+        if (addr.verdict === "ambient" || addr.verdict === "not_me") {
+          logger.info(
+            { chatId: job.chatId, messageId: formatted.messageId, verdict: addr.verdict, reason: addr.reason },
+            "Pipeline complete (floor: not addressed, context saved)",
+          );
+          return;
+        }
+      } catch (err) {
+        logger.debug({ err, chatId: job.chatId }, "floor classify failed (non-critical, fall through)");
       }
     }
 
@@ -380,6 +431,23 @@ export async function processPipeline(job: ChatJob): Promise<void> {
     }
     timings["judge"] = Math.round(performance.now() - t3);
 
+    // Core v2 Phase 1 shadow: graylist 群里，旧判之后跑 core 分层判，
+    // 只记日志对比（agree/分歧），不改行为。fire-and-forget，失败静默。
+    // CORE_V2_CHAT_IDS 为空 → isCoreChat 全 false → 零开销。
+    try {
+      const { isCoreChat, shadowCompare } = await import("../core/loop.js");
+      if (isCoreChat(job.chatId)) {
+        void shadowCompare({
+          chatId: job.chatId,
+          message: formatted,
+          legacy: judgeResult,
+          cognitiveAnchorEventId: job.cognitiveAnchorEventId,
+          burstHint,
+          focusLevel,
+        });
+      }
+    } catch { /* shadow never breaks the pipeline */ }
+
     // Post-judge: path resolution, mute/sleep/timing gates, reply generation
     const postResult = await runPostJudge({
       judgeResult,
@@ -400,4 +468,3 @@ export async function processPipeline(job: ChatJob): Promise<void> {
     await releaseHeldChatLock();
   }
 }
-

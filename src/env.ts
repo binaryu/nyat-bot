@@ -225,6 +225,9 @@ const envSchema = z.object({
 
   // ── Proactive Engagement (Stage B) ──
   JUDGE_PROACTIVE_ENABLED: booleanFromEnv.default(false),
+  // H1.1 floor/addressee 三档（默认 OFF，OFF = 老路零变化）。
+  // 开后：ambient/not_me 先记 floor_decisions 再按规则短路，to_me 才进 judge。
+  FLOOR_ENABLED: booleanFromEnv.default(false),
   JUDGE_PROACTIVE_RATE: z.coerce.number().min(0).max(1).default(0.25),
   JUDGE_PROACTIVE_MIN_INTERVAL_SEC: z.coerce.number().int().positive().default(120),
   JUDGE_PROACTIVE_MIN_RECENT_MSGS: z.coerce.number().int().positive().default(3),
@@ -378,6 +381,21 @@ const envSchema = z.object({
   // 任务终态复盘蒸馏成 episode + 可复用经验；开工前按 contentDirection
   // 检索相关经验注入 executor prompt。复盘走便宜链，失败静默不重试。
   DISTILL_USAGE: z.string().default('summarize'),
+  // ── 自我技能沉淀（AGI 自我 skill 系统）────────────────────────────────
+  // 每 6h 从 episodes + experience_entries 蒸馏「小 skill」,每周合并去重
+  // 成「大 skill」并归档小 skill 防爆。skill 是结构化能力单元(触发条件/
+  // 步骤/坑),区别于碎片化经验。开工前按 contentDirection 检索注入。
+  SKILL_DISTILL_ENABLED: booleanFromEnv.default(false),
+  SKILL_DISTILL_USAGE: z.string().default('summarize'),
+  SKILL_DISTILL_INTERVAL_MIN: z.coerce.number().int().positive().default(360),
+  SKILL_CONSOLIDATE_ENABLED: booleanFromEnv.default(false),
+  SKILL_CONSOLIDATE_USAGE: z.string().default('judge'),
+  SKILL_MAX_BIG: z.coerce.number().int().min(1).default(50),
+  // ── 爱好系统（从群友爱好蒸馏 bot 自己的爱好）────────────────────────
+  // 聚合群友常聊话题 → LLM 蒸馏成 bot 自己的爱好 → 注入 self-state。
+  // 慢变量(几天重蒸馏一次),区别于 obsessions 的 3h 短周期轮换。
+  HOBBY_DISTILL_ENABLED: booleanFromEnv.default(false),
+  HOBBY_DISTILL_USAGE: z.string().default('summarize'),
   // ── AGI Level 5 Phase 1: 经验验证器（常驻）────────────────────────────
   // 注入的经验在任务终态打分：done+干净路径 → success_count；failed →
   // failure_count。成功≥2 次 → verified=1(已证实)，失败≥2 次 → verified=2
@@ -392,6 +410,12 @@ const envSchema = z.object({
   // goal 升级为跨周持续关注:check_goal 主动探查世界悄悄的变化(VibeLifeBench)。
   // long_term goal 的 stale 窗口放宽到 30 天。
   GOAL_LONG_TERM_ENABLED: booleanFromEnv.default(false),
+  // ── Phase 2: 证据门学习 ──────────────────────────────────────────
+  // 默认 OFF:OFF 时行为与 Phase-2 之前一致(legacy 直写路径)。
+  // 开启后:goal achieved 必须 host verified;skill verified_use 独立计数;自改 prompt 受冷却/长度限制。
+  GOAL_EVIDENCE_GATE_ENABLED: booleanFromEnv.default(false),
+  SKILL_VERIFIED_USE_ENABLED: booleanFromEnv.default(false),
+  SELF_EDIT_GUARDRAILS_ENABLED: booleanFromEnv.default(false),
   // ── AGI Level 5 Phase 4: Loop 策略资产化 ─────────────────────────────
   // executor 循环策略(验证/重试/停止)从静态升级为可进化资产:
   // 注入 prompt + 任务终态计数,成功率 <30% 自动 disable。
@@ -426,6 +450,86 @@ const envSchema = z.object({
   // ── AGI Level 6 Phase 14: 反向阀门 L7 ───────────────────────────────
   // 连接率埋点(新核心指标)+ 私聊风险分档。初期只记录不改行为。
   CONNECTIVITY_TRACKING_ENABLED: booleanFromEnv.default(false),
+  // Phase 14.1 接线: DM 风险 → 写手提示 + humanizer 衰减。默认 OFF,OFF 时
+  // currentRiskLevel 恒 low(提示/衰减全是 undefined,行为与改造前逐字节一致)。
+  // 只在 DM(chatId > 0)生效,群聊零变化。
+  REVERSE_VALVE_ENABLED: booleanFromEnv.default(false),
+  // ── Core v2 Phase 0: Belief View + 黑板 ACL + L2 permission gate ──
+  // 全部默认 OFF。Phase 0 是纯地基（新表+纯函数），不接任何主路径，
+  // 开了也只影响 eval harness 和未来的 graylist 群。
+  CORE_BELIEF_VIEW_ENABLED: booleanFromEnv.default(false),
+  CORE_BLACKBOARD_ENABLED: booleanFromEnv.default(false),
+  CORE_PERMISSION_GATE_ENABLED: booleanFromEnv.default(false),
+  // Host-owned Agency rollout mode. The default keeps Core proposals observable
+  // without allowing them to dispatch adapters or create external side effects.
+  AGENCY_RUNTIME_MODE: z.enum(['shadow', 'advisory', 'canary', 'authority']).default('shadow'),
+  AGENCY_CANARY_CHAT_IDS: z
+    .string()
+    .default('')
+    .transform((s) => {
+      const t = s.trim();
+      if (!t) return [] as number[];
+      return t
+        .split(',')
+        .map((x) => Number(x.trim()))
+        .filter((n) => Number.isSafeInteger(n) && n !== 0);
+    }),
+  AGENCY_MAX_LLM_CALLS: z.coerce.number().int().min(0).max(100).default(2),
+  AGENCY_MAX_TOOL_CALLS: z.coerce.number().int().min(0).max(100).default(8),
+  AGENCY_FAIL_CLOSED: booleanFromEnv.default(true),
+  // Explicit authority-only CodeAct queue binding. Shadow/advisory/canary keep
+  // the legacy host path; authority rejects instead of silently bypassing it.
+  AGENCY_CODEACT_TRANSPORT_ENABLED: booleanFromEnv.default(false),
+  // Explicit authority-only Reply text binding. Authority failures never fall
+  // back to legacy sender.sendDirect; keep the rollout opt-in.
+  AGENCY_REPLY_TRANSPORT_ENABLED: booleanFromEnv.default(false),
+  // Explicit authority-only wait/timing binding. Authority failures never
+  // fall back to direct transitionToWait; keep the rollout opt-in.
+  AGENCY_WAIT_TRANSPORT_ENABLED: booleanFromEnv.default(false),
+  // Record successful legacy Reply deliveries as observed Agency outcomes.
+  // This never dispatches or sends; keep it opt-in until the ledger is sized.
+  AGENCY_LEGACY_REPLY_OBSERVATION_ENABLED: booleanFromEnv.default(false),
+  // Durable perception/event log. Disable only for emergency rollback; callers
+  // remain fail-soft when the migration is not present yet.
+  COGNITIVE_EVENTS_ENABLED: booleanFromEnv.default(true),
+  COGNITIVE_OUTBOX_ENABLED: booleanFromEnv.default(true),
+  // Assemble the scoped cognitive workspace for legacy reply/Heart/Meta paths.
+  // Keep it opt-in until latency and prompt-budget measurements are available.
+  COGNITIVE_WORKSPACE_V2_ENABLED: booleanFromEnv.default(false),
+  // Deterministic fast/deep/background routing telemetry. It is shadow-only
+  // until a later rollout explicitly consumes the decision for behavior.
+  COGNITIVE_ROUTING_ENABLED: booleanFromEnv.default(false),
+  // Optional behavior rollout: deep Reply routes and signal-bearing background
+  // ticks may opt into the scoped workspace. Empty chat list means all chats;
+  // keep disabled by default.
+  COGNITIVE_ROUTING_BEHAVIOR_ENABLED: booleanFromEnv.default(false),
+  COGNITIVE_ROUTING_CHAT_IDS: z
+    .string()
+    .default('')
+    .transform((s) => {
+      const t = s.trim();
+      if (!t) return [] as number[];
+      return t
+        .split(',')
+        .map((x) => Number(x.trim()))
+        .filter((n) => Number.isSafeInteger(n) && n !== 0);
+    }),
+  // Metadata-only group interaction expectations and host-observed social
+  // prediction error. It never changes reply selection; keep rollout opt-in.
+  SOCIAL_PREDICTION_ENABLED: booleanFromEnv.default(false),
+  // 总开关（默认开；关掉则 isCoreChat 全 false，shadow 零开销）。
+  CORE_V2_ENABLED: booleanFromEnv.default(true),
+  // Phase 2 双写：旧表写入后同步 belief（读投影）。默认开（best-effort，
+  // 失败只打日志不拦路）。关掉则 core_beliefs 停更，读侧照常。
+  CORE_DUAL_WRITE: booleanFromEnv.default(true),
+  // 灰度群，逗号分隔。空 = 全量生效（与 TURN_ACTOR/MULTI_AGENT 一致）。
+  CORE_V2_CHAT_IDS: z.string().default(''),
+  // Belief View 注入 prompt 的预算（Phase 2 才用，Phase 0 只定义）
+  BELIEF_VIEW_INJECT_MAX: z.coerce.number().int().default(4),
+  BELIEF_TTL_DEFAULT_SEC: z.coerce.number().int().default(7776000),
+  // Phase 6：drive satiation 半衰期（秒，默认 6h，与 norms TTL 同量级）。
+  // halflifeSec() 经 env() 读这里（Phase 6 前直读 process.env，已收敛）。
+  CORE_DRIVE_SATIATION_HALFLIFE_SEC: z.coerce.number().int().positive().default(21600),
   // 谄媚审计: 每周抽 200 条回复按五维打分,纯离线。
   SYCOPHANCY_AUDIT_ENABLED: booleanFromEnv.default(false),
   // ── AGI Level 6 Phase 15: 小模型增强 ────────────────────────────────
@@ -700,6 +804,40 @@ const envSchema = z.object({
   CODEACT_CONCURRENCY: z.coerce.number().int().positive().default(4),
   // 长时间 Agent 循环：分段续跑 + checkpoint + 上下文压缩。默认关，灰度开。
   AGENT_LOOP_ENABLED: booleanFromEnv.default(false),
+  // 长任务用户可见阶段通知：运行时负责短确认/保活，失败不影响任务执行。
+  TASK_PROGRESS_ENABLED: booleanFromEnv.default(true),
+  TASK_PROGRESS_MIN_INTERVAL_MS: z.coerce.number().int().nonnegative().default(30_000),
+  TASK_PROGRESS_MAX_VISIBLE_UPDATES: z.coerce.number().int().positive().default(6),
+  TASK_PROGRESS_START_DELAY_MS: z.coerce.number().int().nonnegative().default(1_000),
+  TASK_PROGRESS_KEEPALIVE_MS: z.coerce.number().int().positive().default(35_000),
+  TASK_PROGRESS_CODEACT_ENABLED: booleanFromEnv.default(true),
+  TASK_PROGRESS_RESEARCH_ENABLED: booleanFromEnv.default(true),
+  // 认知债务后台扫描（CSR）：过期清理 + 到期债务记录 + 预测误差摘要。默认关，灰度开。
+  DEBT_SWEEP_ENABLED: booleanFromEnv.default(false),
+  DEBT_SWEEP_INTERVAL_MIN: z.coerce.number().int().positive().default(30),
+  // Durable cognitive event projection is safe to run without authority; debt
+  // creation remains a separate opt-in until its false-positive rate is known.
+  DEBT_AUTO_MATCH_ENABLED: booleanFromEnv.default(false),
+  // Optional host-owned semantic ranking after deterministic debt matching.
+  // It never resolves debt and is deliberately off until cost/quality is measured.
+  DEBT_SEMANTIC_MATCH_ENABLED: booleanFromEnv.default(false),
+  DEBT_SEMANTIC_MATCH_USAGE: z.string().default('judge'),
+  DEBT_SEMANTIC_MATCH_MAX_CANDIDATES: z.coerce.number().int().min(0).max(32).default(4),
+  DEBT_SEMANTIC_MATCH_MIN_SCORE: z.coerce.number().min(0).max(1).default(0.72),
+  DEBT_SEMANTIC_MATCH_TIMEOUT_MS: z.coerce.number().int().positive().max(10_000).default(2_500),
+  // LLM group-norm proposals do not mutate the durable hypothesis by default;
+  // verified host evidence uses the separate evidence-gated updater.
+  GROUP_NORMS_AUTO_UPDATE_ENABLED: booleanFromEnv.default(false),
+
+  // 回复形态与安全分段：先灰度控制，关闭时保留旧回复路径。
+  REPLY_MODE_ENABLED: booleanFromEnv.default(true),
+  REPLY_ACK_THEN_EXPAND_ENABLED: booleanFromEnv.default(true),
+  REPLY_MICRO_REACTION_MAX_CHARS: z.coerce.number().int().positive().default(12),
+  REPLY_ACK_MAX_CHARS: z.coerce.number().int().positive().default(12),
+  REPLY_MAX_EXPANSION_SEGMENTS: z.coerce.number().int().positive().default(2),
+  REPLY_LONG_TEXT_SAFE_SPLIT_ENABLED: booleanFromEnv.default(true),
+  REPLY_HUMANIZER_SAFE_MODE: booleanFromEnv.default(true),
+
   // 单个任务最多跑几段（每段 CODEACT_MAX_TURNS 轮）。超限强制诚实收尾。
   AGENT_MAX_SEGMENTS: z.coerce.number().int().positive().default(10),
   // history 超过多少轮触发 LLM 压缩早期轮次。
@@ -711,6 +849,9 @@ const envSchema = z.object({
   AGENT_COMPACT_USAGE: z.string().default('judge'),
   // Subagent host web.search（复用 pipeline executeSearch）。默认开；可关。
   CODEACT_WEB_SEARCH_ENABLED: booleanFromEnv.default(true),
+  // Subagent host pixiv/linux.sb 只读工具。默认关，按灰度开。
+  CODEACT_PIXIV_ENABLED: booleanFromEnv.default(false),
+  CODEACT_LINUXSB_ENABLED: booleanFromEnv.default(false),
   // Context Engine:组装 Meta/Subagent prompt 时打 Manifest(可观测+稳定前缀)。
   CONTEXT_ENGINE_ENABLED: booleanFromEnv.default(true),
   // 日记 dream-journal(独立 flag,可不启 Meta 单独开)。
@@ -756,6 +897,10 @@ const envSchema = z.object({
   SANDBOX_ENABLED: booleanFromEnv.default(false),
   SANDBOX_TERMINAL_ENABLED: booleanFromEnv.default(true),
   SANDBOX_BROWSER_ENABLED: booleanFromEnv.default(true),
+  // Phase 15 真隔离: bwrap userns 沙盒默认开。
+  SANDBOX_BWRAP_ENABLED: booleanFromEnv.default(true),
+  // 隔离能力不可用时默认拒绝执行；仅在明确应急配置为 false 时允许宿主回退。
+  SANDBOX_REQUIRE_ISOLATION: booleanFromEnv.default(true),
   SANDBOX_ALLOWED_COMMANDS: z.string().default(''),
   SANDBOX_BLOCKED_COMMANDS: z.string().default('rm -rf,shutdown,reboot,mkfs,halt,dd if=,chmod 777'),
 
@@ -873,6 +1018,18 @@ const envSchema = z.object({
   // chat 路径也跑记忆员+人设员+导演(direct 闲聊也带 grounding,多走 agentic、多吃 token;
   // 嫌延迟可关)。研究员/核查/Critic 仍只在 lookup/deep。
   MULTI_AGENT_CHAT_SPECIALISTS: booleanFromEnv.default(true),
+  // Route-convergence experiment: for an explicit allowlist, direct/fast
+  // replies stop spawning chat specialists; deep/lookup keep only work
+  // justified by their route. Default remains legacy.
+  MULTI_AGENT_ROUTE_CONVERGENCE_ENABLED: booleanFromEnv.default(false),
+  MULTI_AGENT_ROUTE_CHAT_IDS: z
+    .string()
+    .default('')
+    .transform((s) => {
+      const t = s.trim();
+      if (!t) return [] as number[];
+      return t.split(',').map((x) => Number(x.trim())).filter((n) => Number.isSafeInteger(n) && n !== 0);
+    }),
   // Phase 3 核查员:核查研究员产出(lookup + deep 路径跑,有研究员素材才跑)。
   MULTI_AGENT_CHECKER_ENABLED: booleanFromEnv.default(true),
   MULTI_AGENT_CHECKER_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
@@ -1032,6 +1189,9 @@ export interface EnvProvider {
   /** 声明是否支持图片输入(P2 多模态回复)。undefined=未知(照发,provider 自己拒);
    *  false=明确不支持(带图调用直接跳过该 label,不白烧一跳)。 */
   vision?: boolean;
+  /** Smart Group auto-assign 质量分层: high=主力回复模型, medium=中等(judge/summarize),
+   *  low=廉价快模型(gate/cheap batch)。未声明默认 medium。 */
+  tier?: 'high' | 'medium' | 'low';
 }
 
 export interface EnvUsage {
@@ -1040,6 +1200,7 @@ export interface EnvUsage {
   timeout?: number;
   maxTokens?: number;
   temperature?: number;
+  jsonMode?: boolean;
 }
 
 let _providers: Map<string, EnvProvider> | undefined;
@@ -1221,7 +1382,7 @@ export function getProviders(): Map<string, EnvProvider> {
   for (const [key, value] of Object.entries(source)) {
     if (!key.startsWith('AI_PROVIDER_') || !value) continue;
     const rest = key.slice('AI_PROVIDER_'.length);
-    const fields = ['ENDPOINT', 'KEY', 'MODEL', 'FORMAT', 'STREAM', 'REASONING', 'THINKING', 'INSECURE', 'TIMEOUT', 'MAX_TOKENS', 'TEMPERATURE', 'RAW', 'VISION'] as const;
+    const fields = ['ENDPOINT', 'KEY', 'MODEL', 'FORMAT', 'STREAM', 'REASONING', 'THINKING', 'INSECURE', 'TIMEOUT', 'MAX_TOKENS', 'TEMPERATURE', 'RAW', 'VISION', 'TIER'] as const;
     let matchedField: string | undefined;
     let providerName: string | undefined;
     for (const f of fields) {
@@ -1255,6 +1416,7 @@ export function getProviders(): Map<string, EnvProvider> {
       maxTokens: (() => { const n = fields['MAX_TOKENS'] ? parseInt(fields['MAX_TOKENS'], 10) : NaN; return Number.isFinite(n) && n > 0 ? n : undefined; })(),
       temperature: (() => { const n = fields['TEMPERATURE'] ? parseFloat(fields['TEMPERATURE']) : NaN; return Number.isFinite(n) ? n : undefined; })(),
       vision: readBool(fields['VISION']),
+      tier: (fields['TIER'] === 'high' || fields['TIER'] === 'low') ? fields['TIER'] : (fields['TIER'] === 'medium' ? 'medium' : undefined),
     });
   }
 
@@ -1263,7 +1425,7 @@ export function getProviders(): Map<string, EnvProvider> {
 }
 
 /**
- * Parse AI_USAGE_<NAME>_LABEL/BACKUPS/TIMEOUT/MAX_TOKENS/TEMPERATURE from process.env.
+ * Parse AI_USAGE_<NAME>_LABEL/BACKUPS/TIMEOUT/MAX_TOKENS/TEMPERATURE/JSON_MODE from process.env.
  * Usage names are lowercased (with underscores preserved for multi-word names like REPLY_PRO).
  * Also synthesizes compatibility routing for legacy AI_MODEL_* envs when explicit AI_USAGE_* entries are absent.
  */
@@ -1276,7 +1438,7 @@ export function getUsageRouting(): Map<string, EnvUsage> {
   for (const [key, value] of Object.entries(source)) {
     if (!key.startsWith('AI_USAGE_') || !value) continue;
     const rest = key.slice('AI_USAGE_'.length);
-    const fields = ['LABEL', 'BACKUPS', 'TIMEOUT', 'MAX_TOKENS', 'TEMPERATURE'] as const;
+    const fields = ['LABEL', 'BACKUPS', 'TIMEOUT', 'MAX_TOKENS', 'TEMPERATURE', 'JSON_MODE'] as const;
     let matchedField: string | undefined;
     let usageName: string | undefined;
     for (const f of fields) {
@@ -1303,6 +1465,9 @@ export function getUsageRouting(): Map<string, EnvUsage> {
       timeout: readNumber(fields['TIMEOUT']),
       maxTokens: readNumber(fields['MAX_TOKENS']),
       temperature: readNumber(fields['TEMPERATURE']),
+      jsonMode: fields['JSON_MODE'] !== undefined
+        ? /^(1|true|yes|on)$/i.test(fields['JSON_MODE'])
+        : undefined,
     });
   }
 
