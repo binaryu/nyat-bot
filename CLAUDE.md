@@ -13,11 +13,7 @@ NyatBot (`nyat-bot`) — a Telegram AI 群聊喵娘 bot. TypeScript, Node ≥22,
 
 Baseline: `npm run typecheck`, `npm run lint` and the vitest suite are **all clean** — zero warnings, zero failures. Any output is a real regression. (Earlier revisions of this file claimed two known unused-var warnings in `message.ts:57` / `prompt-builder.ts:169`, and AGENTS.md claimed one; both were stale — those warnings no longer exist.)
 
-⚠️ **Run tests with the same Node the service uses.** `/usr/local/bin/node` is v25.x, but the systemd unit runs `/root/.hermes/node/bin/node` (v22), and `better-sqlite3`'s prebuilt binary is compiled for the v22 ABI. Under v25 the native module fails to load and **226 tests fail spuriously** with `Module did not self-register`. Always:
-
-```bash
-export PATH=/root/.hermes/node/bin:$PATH && npm run test
-```
+**Node runtime**: The service and test suites run on **Node v22** (system default `/usr/bin/node` v22.x, matching `package.json`'s `>=22.0.0 <23` requirement). `better-sqlite3`'s prebuilt binary is compiled for the v22 ABI.
 
 ## Non-obvious conventions
 

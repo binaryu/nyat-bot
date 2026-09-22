@@ -81,6 +81,8 @@ const envSchema = z.object({
 
   // Tool System
   SKILLS_DIR: z.string().default('./data/skills'),
+  MCP_ENABLED: booleanFromEnv.default(false),
+  MCP_CONFIG_PATH: z.string().default('./config/mcp.json'),
   SEARXNG_URL: z.string().url().optional(),
   XAI_API_KEY: z.string().optional(),
   XAI_SEARCH_BASE_URL: z.string().url().default('https://new-api-zhcm.onrender.com/v1'),

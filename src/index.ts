@@ -31,7 +31,7 @@ import {
   shouldRegisterBotCommands,
   shouldWarmMemory,
 } from './startup/side-effects.js';
-import { preloadSkills } from './pipeline/tools/registry.js';
+import { preloadSkills, preloadMcpTools } from './pipeline/tools/registry.js';
 import { startMetaLoop, stopMetaLoop } from './meta/index.js';
 import { startCodeActWorker, closeCodeActWorker } from './subagent/index.js';
 import { getSandboxCapability } from './sandbox/terminal.js';
@@ -45,6 +45,13 @@ async function main(): Promise<void> {
 
   // 1.5 Preload external skills
   void preloadSkills();
+
+  // 1.6 Preload MCP tools if enabled
+  if (config.MCP_ENABLED) {
+    void preloadMcpTools().catch((err) => {
+      logger.warn({ err }, 'Failed to preload MCP tools');
+    });
+  }
 
   // 2. Connect Redis
   const redis = getRedis();
@@ -366,6 +373,15 @@ async function main(): Promise<void> {
       await closeWorker();
       step('queue');
       await closeQueue();
+      step('mcp-clients');
+      if (config.MCP_ENABLED) {
+        try {
+          const { getMcpClientManager } = await import('./pipeline/tools/mcp/index.js');
+          await getMcpClientManager().closeAll();
+        } catch (err) {
+          logger.warn({ err }, 'Failed to close MCP clients');
+        }
+      }
       // token 记账最后 flush 一次(别丢最后一分钟的账),需在 closeDb 之前。
       try { const { stopTokenLedger } = await import('./metrics/token-ledger.js'); stopTokenLedger(); } catch { /* non-critical */ }
       try { const { stopSocialLedger } = await import('./metrics/social-ledger.js'); stopSocialLedger(); } catch { /* non-critical */ }

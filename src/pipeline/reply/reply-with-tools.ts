@@ -8,10 +8,11 @@
 //   - 无工具时 ≈ 纯文本写手速度(一步出 JSON)
 //   - 有工具时省掉独立 planner 轮 + 省把完整上下文重发一遍
 // 注意:写手 label 多带 reasoningEffort → 正常走 raw fetch 不支持 AI SDK
-// 工具循环;这里强制走 createOpenAI 路径(工具回合丢 reasoning_effort,
-// low 档影响很小)。失败回退由调用方退回老两段路径。
+// 工具循环;这里根据 label.apiFormat 动态选用 createAnthropic 或 createOpenAI。
+// 失败回退由调用方退回老两段路径。
 
 import { generateText } from 'ai';
+import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { getUsage, getLabel } from '../../ai/labels.js';
 import { CooldownTracker } from '../../ai/cooldown.js';
@@ -61,14 +62,18 @@ export async function generateReplyWithTools(input: ReplyWithToolsInput): Promis
   for (const labelName of labelNames) {
     const label = getLabel(labelName);
     const apiKey = label.apiKeys[0];
-    if (!apiKey || label.apiFormat === 'claude') continue; // claude 原生格式跳过(AI SDK 工具走 openai 兼容)
+    if (!apiKey) continue;
     if (await cooldown.isCoolingDown(label.model).catch(() => false)) continue;
 
     try {
-      const provider = createOpenAI({ baseURL: label.endpoint, apiKey, compatibility: 'compatible' });
+      const model =
+        label.apiFormat === 'claude'
+          ? createAnthropic({ baseURL: label.endpoint, apiKey })(label.model)
+          : createOpenAI({ baseURL: label.endpoint, apiKey, compatibility: 'compatible' })(label.model, {
+              structuredOutputs: false,
+            });
       const result = await generateText({
-        // structuredOutputs:false → 工具不带 strict(可选参数工具会被 OpenAI 400)
-        model: provider(label.model, { structuredOutputs: false }),
+        model,
         messages: input.messages as Parameters<typeof generateText>[0]['messages'],
         tools,
         maxSteps,

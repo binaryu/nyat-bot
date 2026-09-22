@@ -22,6 +22,7 @@ import {
 } from './agent-tools.js';
 import { env } from '../../env.js';
 import { loadSkills, type LoadedSkillEntry } from './skill-loader.js';
+import { getMcpClientManager } from './mcp/index.js';
 
 // Skills are loaded once at startup and cached
 let _skillsCache: Record<string, LoadedSkillEntry> | undefined;
@@ -33,6 +34,12 @@ export function preloadSkills(): Promise<void> {
     _skillsCache = skills;
   });
   return _skillsLoading;
+}
+
+export async function preloadMcpTools(configPath?: string): Promise<void> {
+  if (env().MCP_ENABLED) {
+    await getMcpClientManager().connectAll(configPath);
+  }
 }
 
 function buildSchemasAndTools(
@@ -212,6 +219,14 @@ function buildSchemasAndTools(
     }
   }
 
+  // MCP tools (when MCP_ENABLED is true)
+  if (e.MCP_ENABLED) {
+    const mcpTools = getMcpClientManager().getTools();
+    for (const [name, entry] of Object.entries(mcpTools)) {
+      register(name, entry.parameterSchema, entry.tool);
+    }
+  }
+
   // Jargon query tool (Stage D)
   const jargonDef = buildJargonTool(chatId);
   if (jargonDef) {
@@ -271,6 +286,14 @@ export function buildToolSet(
   if (!only || only.length === 0) return all;
   // 专家工具子集:只保留 allow 名单里的工具(研究员拿 SEARCH/FETCH 等)。
   const allow = new Set(only);
+  if (env().MCP_ENABLED) {
+    const mcpTools = getMcpClientManager().getTools();
+    for (const entry of Object.values(mcpTools)) {
+      if (allow.has(entry.originalName)) {
+        allow.add(entry.name);
+      }
+    }
+  }
   const out: Record<string, Tool> = {};
   for (const [name, t] of Object.entries(all)) {
     if (allow.has(name)) out[name] = t;
@@ -289,8 +312,18 @@ export async function executeValidatedToolStep(
   userId: number,
 ): Promise<unknown> {
   const { tools, schemas } = buildSchemasAndTools(chatId, userId);
-  const schema = schemas.get(toolName);
-  const t = tools[toolName];
+  let schema = schemas.get(toolName);
+  let t = tools[toolName];
+  if ((!schema || !t?.execute) && env().MCP_ENABLED) {
+    const mcpTools = getMcpClientManager().getTools();
+    for (const entry of Object.values(mcpTools)) {
+      if (entry.originalName === toolName || entry.name.toLowerCase() === toolName.toLowerCase()) {
+        schema = entry.parameterSchema;
+        t = entry.tool;
+        break;
+      }
+    }
+  }
   if (!schema || !t?.execute) {
     throw new Error(`Unknown or non-executable tool: ${toolName}`);
   }

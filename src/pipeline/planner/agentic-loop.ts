@@ -12,6 +12,7 @@
 // agentic 是增强,不是单点。
 
 import { generateText } from 'ai';
+import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { getUsage, getLabel } from '../../ai/labels.js';
 import { CooldownTracker } from '../../ai/cooldown.js';
@@ -70,23 +71,26 @@ export async function runAgenticPlanner(input: AgenticPlanInput): Promise<Agenti
   for (const labelName of labelNames) {
     const label = getLabel(labelName);
     const apiKey = label.apiKeys[0];
-    if (!apiKey || label.apiFormat === 'claude') continue; // claude 原生格式标签跳过
+    if (!apiKey) continue;
     if (await cooldown.isCoolingDown(label.model).catch(() => false)) {
       logger.debug({ label: labelName, model: label.model }, 'Agentic planner skipping cooled-down label');
       continue;
     }
 
     try {
-      const provider = createOpenAI({
-        baseURL: label.endpoint,
-        apiKey,
-        compatibility: 'compatible',
-      });
+      const model =
+        label.apiFormat === 'claude'
+          ? createAnthropic({ baseURL: label.endpoint, apiKey })(label.model)
+          : createOpenAI({
+              baseURL: label.endpoint,
+              apiKey,
+              compatibility: 'compatible',
+            })(label.model, { structuredOutputs: false });
       const result = await generateText({
         // structuredOutputs:false → 工具不带 strict:true。strict 模式要求
         // required 含全部 key,带可选参数的工具(FETCH_HISTORY/ADD_TIMER)
         // 会被 OpenAI 端 400(冒烟实测);zod 在执行侧已兜底校验。
-        model: provider(label.model, { structuredOutputs: false }),
+        model,
         system: systemPrompt,
         messages: [{ role: 'user', content: buildUserPrompt(input) }],
         tools,

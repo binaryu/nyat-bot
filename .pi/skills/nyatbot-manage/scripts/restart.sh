@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/root/.hermes/node/bin:$PATH"
 REPO_DIR="/opt/nyatbot"
 cd "$REPO_DIR"
 
