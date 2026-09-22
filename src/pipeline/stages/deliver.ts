@@ -35,6 +35,7 @@ import {
   editMessage,
   reactToMessage,
 } from "../../bot/sender/telegram.js";
+import { isRichHtml } from "../../bot/sender/rich-html.js";
 import { recordReply } from "../../tracking/outcome.js";
 import {
   getReadyStickersByIntent,
@@ -733,19 +734,20 @@ export async function generateAndSendReplies(args: {
         await new Promise((resolve) => setTimeout(resolve, (ackPrefix.delay ?? 1.5) * 1000));
       }
 
-      // ── Humanizer: skip humanizer effects for interjection segments ──
+      // ── Humanizer: skip humanizer effects for interjection segments or Rich HTML ──
       const isInterjection = reply.isInterjection === true;
+      const isRich = isRichHtml(reply.replyContent);
 
       // ── Humanizer: typo injection ──
-      // Skip for DM — users expect instant, clean response in private chat
+      // Skip for DM or Rich HTML — users expect instant, clean response, and HTML tags must not be corrupted
       const humanizedText = reply.replyContent;
-      const typoResult = humanizerBudget > 0 && !isDmChat && !isInterjection && replyIdx === 0 && humanizedText.length >= 4
+      const typoResult = !isRich && humanizerBudget > 0 && !isDmChat && !isInterjection && replyIdx === 0 && humanizedText.length >= 4
         ? (() => { const r = injectTypo(humanizedText, humanizerConfig); return r.typoIndex >= 0 ? r : null; })()
         : null;
       if (typoResult) humanizerBudget--;
 
-      // ── Humanizer: delete-and-resend (skip for interjections and DM) ──
-      const deleteResend = isDmChat || isInterjection || humanizerBudget <= 0
+      // ── Humanizer: delete-and-resend (skip for interjections, DM, and Rich HTML) ──
+      const deleteResend = isRich || isDmChat || isInterjection || humanizerBudget <= 0
         ? { shouldDeleteResend: false, deleteDelay: 0, modifiedText: humanizedText }
         : decideDeleteResend(replyIdx, replies.length, humanizedText, humanizerConfig);
       if (deleteResend.shouldDeleteResend) humanizerBudget--;
@@ -1002,8 +1004,8 @@ export async function generateAndSendReplies(args: {
               logger.debug({ chatId: job.chatId, typo: effectiveText, appended: typoResult.correctChar }, 'Humanizer: typo append');
             }
 
-            // ── Humanizer: afterthought edit (skip for interjections and DM) ──
-            if (!agencyReplyTransport && !isDmChat && !isInterjection && currentMessageId && humanizerBudget > 0) {
+            // ── Humanizer: afterthought edit (skip for interjections, DM, and Rich HTML) ──
+            if (!isRich && !agencyReplyTransport && !isDmChat && !isInterjection && currentMessageId && humanizerBudget > 0) {
               const afterthought = decideAfterthoughtEdit(currentBaseText, humanizerConfig);
               if (afterthought.shouldEdit) {
                 humanizerBudget--;

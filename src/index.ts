@@ -48,9 +48,12 @@ async function main(): Promise<void> {
 
   // 1.6 Preload MCP tools if enabled
   if (config.MCP_ENABLED) {
-    void preloadMcpTools().catch((err) => {
+    try {
+      await preloadMcpTools();
+      logger.info('MCP tools preloaded successfully');
+    } catch (err) {
       logger.warn({ err }, 'Failed to preload MCP tools');
-    });
+    }
   }
 
   // 2. Connect Redis

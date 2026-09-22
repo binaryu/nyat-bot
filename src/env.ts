@@ -79,21 +79,21 @@ const envSchema = z.object({
   STREAMING_MIN_INTERVAL: z.coerce.number().int().nonnegative().default(500),
   STREAMING_MIN_CHARS: z.coerce.number().int().nonnegative().default(50),
 
+  // Telegram Rich Messages
+  RICH_MESSAGE_ENABLED: booleanFromEnv.default(false),
+  RICH_MESSAGE_CHAT_IDS: z
+    .string()
+    .default('')
+    .transform((s) => {
+      const t = s.trim();
+      if (!t) return [] as number[];
+      return t.split(',').map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n) && n !== 0);
+    }),
+
   // Tool System
   SKILLS_DIR: z.string().default('./data/skills'),
   MCP_ENABLED: booleanFromEnv.default(false),
   MCP_CONFIG_PATH: z.string().default('./config/mcp.json'),
-  SEARXNG_URL: z.string().url().optional(),
-  XAI_API_KEY: z.string().optional(),
-  XAI_SEARCH_BASE_URL: z.string().url().default('https://new-api-zhcm.onrender.com/v1'),
-  XAI_SEARCH_MODEL: z.string().default('grok-4.3-fast'),
-  // Gemini 联网搜索(Google Search grounding,AI Studio key)。配 KEY 即为主搜索路由。
-  // 注:3.1-flash-lite 的 grounding 在免费 key 上 quota=0(需计费);2.5-flash-lite 免费可用。
-  GEMINI_API_KEY: z.string().optional(),
-  GEMINI_SEARCH_MODEL: z.string().default('gemini-2.5-flash-lite'),
-  // 本机真实出口地区不支持 grounding(400 User location not supported);设代理只让
-  // Gemini 搜索这一路走代理(其余流量直连,免得 Redis/Qdrant/Firecrawl 等本地连接被绕)。
-  GEMINI_SEARCH_PROXY: z.string().optional(),
   FETCH_GATEWAY_URL: z.string().optional(),
   FETCH_WORKER_URL: z.string().url().optional(),
   // Firecrawl 兜底:JS 重页面 / Cloudflare 验证页,免费路由(直连/Jina/本地绕过)
@@ -1480,4 +1480,11 @@ export function getUsageRouting(): Map<string, EnvUsage> {
 export function _resetEnvRoutingCache(): void {
   _providers = undefined;
   _usages = undefined;
+}
+
+export function isRichMessageEnabled(chatId?: number): boolean {
+  const e = env();
+  if (!e.RICH_MESSAGE_ENABLED) return false;
+  if (!chatId || e.RICH_MESSAGE_CHAT_IDS.length === 0) return true;
+  return e.RICH_MESSAGE_CHAT_IDS.includes(chatId);
 }

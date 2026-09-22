@@ -121,3 +121,29 @@ describe('toMarkdownV2 — spoiler ||...||（Telegram 较新实体）', () => {
     expect(toMarkdownV2('||第一行\n第二行||')).toBe('\\|\\|第一行\n第二行\\|\\|');
   });
 });
+
+describe('toMarkdownV2 — rich text markdown links & boundary spacing', () => {
+  it('converts [title](url) to MarkdownV2 inline link entity', () => {
+    expect(toMarkdownV2('详情见 [Cloudflare 博文](https://blog.cloudflare.com/kitesurf) 超棒')).toBe(
+      '详情见 [Cloudflare 博文](https://blog.cloudflare.com/kitesurf) 超棒',
+    );
+  });
+
+  it('escapes MarkdownV2 specials in markdown link title', () => {
+    expect(toMarkdownV2('[Node.js v22.0!](https://nodejs.org)')).toBe(
+      '[Node\\.js v22\\.0\\!](https://nodejs.org)',
+    );
+  });
+
+  it('pads space before bare URL when preceded by Chinese punctuation/text without space', () => {
+    expect(toMarkdownV2('用的：https://example.com/page，完全')).toBe(
+      '用的： [https://example\\.com/page](https://example.com/page)，完全',
+    );
+  });
+
+  it('pads space after bare URL when followed by Chinese text without space', () => {
+    expect(toMarkdownV2('链接https://example.com/page详情')).toBe(
+      '链接 [https://example\\.com/page](https://example.com/page) 详情',
+    );
+  });
+});

@@ -1,130 +1,120 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock env
-vi.mock('../../../../src/env.js', () => ({
-  env: () => ({
-    GEMINI_API_KEY: process.env['TEST_GEMINI_API_KEY'],
-    GEMINI_SEARCH_MODEL: 'gemini-test',
-    GEMINI_SEARCH_PROXY: undefined,
-    XAI_API_KEY: process.env['TEST_XAI_API_KEY'],
-    XAI_SEARCH_BASE_URL: 'https://new-api.test/v1',
-    XAI_SEARCH_MODEL: 'grok-test',
-    SEARXNG_URL: 'http://searxng:8080',
-  }),
+const mockEnv = vi.fn(() => ({
+  MCP_ENABLED: true,
 }));
 
-// Mock logger
+vi.mock('../../../../src/env.js', () => ({
+  env: () => mockEnv(),
+}));
+
 vi.mock('../../../../src/shared/logger.js', () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
+const mockCallTool = vi.fn();
+const mockGetTools = vi.fn();
+
+vi.mock('../../../../src/pipeline/tools/mcp/index.js', () => ({
+  getMcpClientManager: () => ({
+    getTools: mockGetTools,
+    callTool: mockCallTool,
+  }),
+}));
+
 import { executeSearch } from '../../../../src/pipeline/tools/search.js';
 
-describe('executeSearch', () => {
-  const originalFetch = globalThis.fetch;
-
+describe('executeSearch via MCP delegation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    delete process.env['TEST_GEMINI_API_KEY'];
-    delete process.env['TEST_XAI_API_KEY'];
+    mockEnv.mockReturnValue({ MCP_ENABLED: true });
+    mockGetTools.mockReturnValue({
+      tavily_search: {
+        serverName: 'tavily',
+        originalName: 'tavily_search',
+        name: 'tavily_search',
+      },
+    });
   });
 
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
+  it('delegates search query to MCP search tool and returns result', async () => {
+    mockCallTool.mockResolvedValue('Detailed Results: Tavily Search Result for query');
+
+    const result = await executeSearch('Node.js 22 LTS');
+    expect(mockCallTool).toHaveBeenCalledWith('tavily', 'tavily_search', {
+      query: 'Node.js 22 LTS',
+    });
+    expect(result).toBe('Detailed Results: Tavily Search Result for query');
   });
 
-  it('returns formatted results on success', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        results: [
-          { title: 'Result 1', content: 'Summary 1', url: 'https://example.com/1' },
-          { title: 'Result 2', content: '<b>Summary</b> 2', url: 'https://example.com/2' },
-        ],
+  it('injects news topic, time_range and start_date for time-sensitive queries', async () => {
+    mockCallTool.mockResolvedValue('Fresh news today');
+
+    const result = await executeSearch('今天的 AI 新闻');
+    expect(mockCallTool).toHaveBeenCalledWith(
+      'tavily',
+      'tavily_search',
+      expect.objectContaining({
+        query: '今天的 AI 新闻',
+        topic: 'news',
+        time_range: 'day',
+        start_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
       }),
-    }) as unknown as typeof fetch;
+    );
+    expect(result).toBe('Fresh news today');
+  });
+
+  it('serializes JSON object results cleanly', async () => {
+    mockCallTool.mockResolvedValue({ answer: 'Clean answer', sources: ['https://example.com'] });
+
+    const result = await executeSearch('What is AI?');
+    expect(result).toContain('"answer": "Clean answer"');
+    expect(result).toContain('"https://example.com"');
+  });
+
+  it('finds generic search tool when tavily_search is not present', async () => {
+    mockGetTools.mockReturnValue({
+      brave_web_search: {
+        serverName: 'brave',
+        originalName: 'web_search',
+        name: 'brave_web_search',
+      },
+    });
+    mockCallTool.mockResolvedValue('Brave search result');
+
+    const result = await executeSearch('Brave test');
+    expect(mockCallTool).toHaveBeenCalledWith('brave', 'web_search', {
+      query: 'Brave test',
+    });
+    expect(result).toBe('Brave search result');
+  });
+
+  it('handles MCP tool error gracefully without throwing', async () => {
+    mockCallTool.mockRejectedValue(new Error('Rate limit exceeded on MCP server'));
+
+    const result = await executeSearch('error query');
+    expect(result).toContain('搜索执行失败');
+    expect(result).toContain('Rate limit exceeded');
+  });
+
+  it('returns informative message when MCP is disabled', async () => {
+    mockEnv.mockReturnValue({ MCP_ENABLED: false });
 
     const result = await executeSearch('test query');
-    expect(result).toContain('关于"test query"的搜索结果：');
-    expect(result).toContain('Result 1');
-    expect(result).toContain('Summary 1');
-    expect(result).toContain('Result 2');
-    // HTML tags should be stripped
-    expect(result).not.toContain('<b>');
+    expect(result).toContain('未配置可用的联网搜索服务');
   });
 
-  it('handles empty results', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ results: [] }),
-    }) as unknown as typeof fetch;
+  it('returns informative message when no search tool is available in MCP', async () => {
+    mockGetTools.mockReturnValue({
+      math_add: {
+        serverName: 'math',
+        originalName: 'add',
+        name: 'math_add',
+      },
+    });
 
-    const result = await executeSearch('nonexistent query');
-    expect(result).toContain('没有找到');
-  });
-
-  it('handles API errors gracefully', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-    }) as unknown as typeof fetch;
-
-    const result = await executeSearch('fail query');
-    expect(result).toContain('搜索失败');
-    expect(result).toContain('500');
-  });
-
-  it('handles network errors', async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('Network error')) as unknown as typeof fetch;
-
-    const result = await executeSearch('fail query');
-    expect(result).toContain('搜索失败');
-    expect(result).toContain('Network error');
-  });
-
-  it('limits results to MAX_RESULTS (5)', async () => {
-    const results = Array.from({ length: 10 }, (_, i) => ({
-      title: `Result ${i}`,
-      content: `Summary ${i}`,
-      url: `https://example.com/${i}`,
-    }));
-
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ results }),
-    }) as unknown as typeof fetch;
-
-    const result = await executeSearch('many results');
-    // Should have exactly 5 results (Result 0 through Result 4)
-    expect(result).toContain('Result 0');
-    expect(result).toContain('Result 4');
-    expect(result).not.toContain('Result 5');
-  });
-
-  it('returns Gemini grounding content + 来源 list (primary route)', async () => {
-    process.env['TEST_GEMINI_API_KEY'] = 'gemini-key';
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        candidates: [{
-          content: {
-            parts: [{ text: 'Cloudflare (NET) 2026 年至今涨超 30%,Q1 财报超预期。' }],
-          },
-          groundingMetadata: {
-            groundingChunks: [
-              { web: { title: 'Cloudflare (NET) Stock Price History 2019-2026', uri: 'https://stockanalysis.com/stocks/net/history/' } },
-              { web: { title: 'Cloudflare Q1 Results Beat Expectations', uri: 'https://finance.yahoo.com/news/net-q1.html' } },
-            ],
-          },
-        }],
-      }),
-    }) as unknown as typeof fetch;
-
-    const result = await executeSearch('Cloudflare NET stock 2026 year performance YTD');
-
-    expect(result).toContain('Cloudflare (NET) 2026');
-    expect(result).toContain('来源');
-    expect(result).toContain('Cloudflare (NET) Stock Price History 2019-2026');
-    expect(result).toContain('Cloudflare Q1 Results Beat Expectations');
+    const result = await executeSearch('test query');
+    expect(result).toContain('未配置可用的联网搜索服务');
+    expect(mockCallTool).not.toHaveBeenCalled();
   });
 });

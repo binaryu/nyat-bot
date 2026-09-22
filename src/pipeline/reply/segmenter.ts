@@ -4,6 +4,7 @@
 // ────────────────────────────────────────
 
 import { logger } from '../../shared/logger.js';
+import { isRichHtml } from '../../bot/sender/rich-html.js';
 
 // ─── Configuration ───
 
@@ -426,6 +427,12 @@ export interface SegmentedReply {
  */
 export function segmentReply(text: string, config?: Partial<SegmenterConfig>): SegmentedReply {
   const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  // 富文本（含 HTML 标签、表格、折叠块等）严禁切片打碎，必须作为完整单条富文本发送
+  if (isRichHtml(text)) {
+    const trimmed = text.trim();
+    return { segments: trimmed ? [trimmed] : [cfg.defaultReply], originalText: text };
+  }
 
   if (!cfg.enabled) {
     const trimmed = text.trim();

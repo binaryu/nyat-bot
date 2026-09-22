@@ -5,6 +5,15 @@
 import { getBot } from '../bot.js';
 import { toMarkdownV2 } from './markdown.js';
 import { shardMarkdownV2, TG_TEXT_LIMIT } from './shard.js';
+import {
+  isRichHtml,
+  sendTelegramRichMessage,
+  editTelegramRichMessage,
+  sanitizeRichHtml,
+  fallbackToStandardHtml,
+  type SendRichOptions,
+} from './rich-html.js';
+import { isRichMessageEnabled } from '../../env.js';
 import { recordSpeech } from '../../tracking/speech-meter.js';
 import { recordBotReply } from '../../tracking/reply-activity.js';
 import { recordBotMessageForConnectivity } from '../../agent/reverse-valve.js';
@@ -226,6 +235,22 @@ export async function sendMessage(
   replyToId?: number,
   messageThreadId?: number,
 ): Promise<number> {
+  // 富文本 HTML 路径：如果内容包含 Rich HTML 标签，优先走 Rich Message / HTML 管道
+  if (isRichHtml(text)) {
+    const richEnabled = isRichMessageEnabled(chatId);
+    const res = await sendTelegramRichMessage({
+      chatId,
+      html: text,
+      replyToId,
+      messageThreadId,
+      forceStandardHtml: !richEnabled,
+    });
+    recordSpeech();
+    recordBotReply(chatId);
+    recordConnectivityWindow(chatId, res.message_id, Math.floor(Date.now() / 1000));
+    return res.message_id;
+  }
+
   const shards = shardMarkdownV2(toMarkdownV2(text));
   if (shards.length > 1) {
     logger.info({ chatId, shards: shards.length, chars: text.length }, 'Reply exceeded Telegram limit, sharding');
@@ -333,6 +358,10 @@ export async function editMessage(
   messageId: number,
   text: string,
 ): Promise<void> {
+  if (isRichHtml(text)) {
+    await editTelegramRichMessage(chatId, messageId, text);
+    return;
+  }
   await withRetry(async () => {
     const bot = getBot();
     try {
@@ -488,3 +517,13 @@ export async function sendChatAction(
     logger.debug({ chatId, action, err }, 'sendChatAction failed (non-critical)');
   }
 }
+
+// 重新导出富文本发送相关接口
+export {
+  sendTelegramRichMessage,
+  editTelegramRichMessage,
+  isRichHtml,
+  sanitizeRichHtml,
+  fallbackToStandardHtml,
+};
+export type { SendRichOptions };

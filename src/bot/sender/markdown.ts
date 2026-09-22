@@ -52,13 +52,31 @@ export function toMarkdownV2(text: string): string {
     return `\x00SP${idx}\x00`;
   });
 
-  // 4. 提取 URL → 还原时包成 [显示文本](href) 链接实体。
+  // 3.7 规范化链接周边的空格：确保链接前后不与汉字或标点直接粘连在一起
+  remaining = remaining.replace(/([^\s(\[])(\[(?:[^\]\n]+)\]\(https?:\/\/[^\s)]+\))/g, '$1 $2');
+  remaining = remaining.replace(/(\[(?:[^\]\n]+)\]\(https?:\/\/[^\s)]+\))([^\s)\].,;:!?。，！？；：…])/g, '$1 $2');
+  remaining = remaining.replace(/([^\s(\[])(https?:\/\/)/g, '$1 $2');
+  remaining = remaining.replace(/(https?:\/\/[^\s>\]\u4e00-\u9fa5\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65]+)(?=[\u4e00-\u9fa5])/g, '$1 ');
+
+  // 3.8 提取 Markdown 格式富文本链接 [title](url)
+  const mdLinks: Array<{ title: string; href: string }> = [];
+  remaining = remaining.replace(
+    /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_, title: string, href: string) => {
+      const idx = mdLinks.length;
+      mdLinks.push({ title, href });
+      return `\x00MDL${idx}\x00`;
+    },
+  );
+
+  // 4. 提取裸 URL → 还原时包成 [显示文本](href) 链接实体。
   // 裸 URL 在严格 MarkdownV2 下不合法:URL 里的 . = - + # 等全是必转义
   // 字符,原样保留必然 can't parse entities → 整条消息掉纯文本回退。
   // ')' 允许出现在 URL 内(维基风格 /wiki/Foo_(bar)),但句尾标点和未
   // 配平的右括号属于行文,循环剥离直到稳定。
+  // 注意：排除 CJK 字符与全角中文标点，避免将后续中文正文吞进 URL 里。
   const urls: string[] = [];
-  remaining = remaining.replace(/(https?:\/\/[^\s>\]]+)/g, (url: string) => {
+  remaining = remaining.replace(/(https?:\/\/[^\s>\]\u4e00-\u9fa5\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65]+)/g, (url: string) => {
     let u = url;
     let trimmed = '';
     for (;;) {
@@ -111,6 +129,14 @@ export function toMarkdownV2(text: string): string {
   // 8. 还原代码块。pre 实体内同样转义 '\' 和 '`'。
   remaining = remaining.replace(/\x00CB(\d+)\x00/g, (_, idx: string) => {
     return `\`\`\`\n${codeBlocks[Number(idx)]!.replace(/([\\`])/g, '\\$1')}\n\`\`\``;
+  });
+
+  // 8.5 还原 Markdown 格式富文本链接: [转义后的标题](转义后的 href)
+  remaining = remaining.replace(/\x00MDL(\d+)\x00/g, (_, idx: string) => {
+    const item = mdLinks[Number(idx)]!;
+    const escapedTitle = escapeMarkdownV2(item.title);
+    const escapedHref = item.href.replace(/([\\)])/g, '\\$1');
+    return `[${escapedTitle}](${escapedHref})`;
   });
 
   // 9. 还原 URL:[转义后的显示文本](转义后的 href)。

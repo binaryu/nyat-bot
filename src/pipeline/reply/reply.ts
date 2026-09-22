@@ -19,6 +19,7 @@ import { searchKnowledge } from '../../knowledge/manager.js';
 import { getToolNames } from '../tools/registry.js';
 import { parseReplyResponse, isBlankReply } from './parser.js';
 import { segmentReply, type SegmenterConfig, REPLY_SPLIT_CHAR_THRESHOLD } from './segmenter.js';
+import { isRichHtml } from '../../bot/sender/rich-html.js';
 import { getRecent, getGroupMembers } from '../context/manager.js';
 import { doCheckin, getCheckinStats } from '../checkin.js';
 import { getBotTracker } from '../../tracking/interaction.js';
@@ -707,6 +708,7 @@ export async function generateReply(
   const DIRECT_TOOL_SUBSET = [
     'SEARCH', 'FETCH', 'RECALL', 'QUERY_MEMORY', 'QUERY_PERSON_PROFILE',
     'FETCH_HISTORY', 'BOT_KNOWLEDGE', 'QUERY_JARGON',
+    'tavily_search', 'tavily_extract',
   ];
 
   if (effectiveReplyPath === 'planned' && !mergedToolsActive && !toolResultsBlock && !orchestratorHandled) {
@@ -1093,7 +1095,10 @@ export async function generateReply(
   // Only apply segmenter to single replies that are either:
   //   a) Long enough to warrant splitting (> threshold), or
   //   b) Explicitly handed off by the AI
+  // Note: Rich HTML messages must never be segmented
+  const isRich = parsedReplies.length === 1 && isRichHtml(parsedReplies[0]!.replyContent);
   const needsSegment =
+    !isRich &&
     parsedReplies.length === 1 &&
     (parsedReplies[0]!.replyContent.length > REPLY_SPLIT_CHAR_THRESHOLD ||
       parsedReplies[0]!.handoffToSplitter === true);
