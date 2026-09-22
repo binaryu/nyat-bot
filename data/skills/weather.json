@@ -1,0 +1,20 @@
+{
+  "name": "WEATHER",
+  "description": "查询指定城市或地区的实时天气状况（含温度、体感温度、湿度、天气现象等）。当用户询问天气、气温、阴晴雨雪等情况时使用。",
+  "parameters": {
+    "city": {
+      "type": "string",
+      "description": "要查询的城市或地区名称，如'北京'、'上海'、'广州'、'Tokyo'、'London'。如果用户未指明城市，默认为'北京'",
+      "required": false,
+      "default": "北京"
+    }
+  },
+  "trusted": true,
+  "execute": {
+    "type": "http",
+    "url": "https://wttr.in/{{city}}?format=%l:+%c+%t+(体感%f)+湿度%h+风速%w&lang=zh&m",
+    "method": "GET",
+    "responseType": "text",
+    "allowedHosts": ["wttr.in"]
+  }
+}

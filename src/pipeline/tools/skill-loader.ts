@@ -13,12 +13,14 @@ import { assertUrlSsrfSafe, fetchUrlPinned } from './ssrf.js';
 
 // ── Schema ────────────────────────────────────────
 
-const paramSchema = z.record(
-  z.object({
-    type: z.enum(['string', 'number', 'boolean']).default('string'),
-    description: z.string().default(''),
-  }),
-);
+const paramItemSchema = z.object({
+  type: z.enum(['string', 'number', 'boolean']).default('string'),
+  description: z.string().default(''),
+  required: z.boolean().default(true),
+  default: z.union([z.string(), z.number(), z.boolean()]).optional(),
+});
+
+const paramSchema = z.record(paramItemSchema);
 
 const httpExecuteSchema = z.object({
   type: z.literal('http'),
@@ -26,7 +28,9 @@ const httpExecuteSchema = z.object({
   method: z.enum(['GET', 'POST', 'PUT', 'DELETE']).default('GET'),
   headers: z.record(z.string()).optional(),
   body: z.record(z.unknown()).optional(),
+  responseType: z.enum(['json', 'text']).default('json'),
   resultPath: z.string().optional(),
+  resultTemplate: z.string().optional(),
   // When trusted=true, every resolved URL must point to one of these hosts
   // (lowercase). Required when trusted is true. Wildcard via "*.example.com".
   allowedHosts: z.array(z.string().min(1)).optional(),
@@ -52,10 +56,11 @@ type ParamDef = z.infer<typeof paramSchema>;
 
 // ── Helpers ───────────────────────────────────────
 
-function applyTemplate(template: string, params: Record<string, unknown>): string {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) =>
-    params[key] !== undefined ? String(params[key]) : `{{${key}}}`,
-  );
+function applyTemplate(template: string, ctx: Record<string, unknown>): string {
+  return template.replace(/\{\{([\w.]+)\}\}/g, (_, key: string) => {
+    const val = getNestedValue(ctx, key);
+    return val !== undefined && val !== null ? String(val) : `{{${key}}}`;
+  });
 }
 
 function isHostAllowed(hostname: string, allowedHosts: readonly string[]): boolean {
@@ -73,6 +78,13 @@ function isHostAllowed(hostname: string, allowedHosts: readonly string[]): boole
 }
 
 function getNestedValue(obj: unknown, path: string): unknown {
+  if (obj === null || obj === undefined) return undefined;
+  if (typeof obj !== 'object') return undefined;
+
+  if (path in (obj as Record<string, unknown>)) {
+    return (obj as Record<string, unknown>)[path];
+  }
+
   return path.split('.').reduce<unknown>((acc, key) => {
     if (acc && typeof acc === 'object') {
       return (acc as Record<string, unknown>)[key];
@@ -88,7 +100,16 @@ function buildZodParams(params: ParamDef): z.ZodObject<Record<string, z.ZodTypeA
     if (def.type === 'number') field = z.number();
     else if (def.type === 'boolean') field = z.boolean();
     else field = z.string();
-    shape[key] = def.description ? field.describe(def.description) : field;
+
+    if (def.description) {
+      field = field.describe(def.description);
+    }
+    if (def.default !== undefined) {
+      field = field.default(def.default);
+    } else if (!def.required) {
+      field = field.optional();
+    }
+    shape[key] = field;
   }
   return z.object(shape);
 }
@@ -153,13 +174,36 @@ async function executeHttp(
     throw new Error(`HTTP ${statusCode}`);
   }
 
+  if (exec.responseType === 'text') {
+    if (exec.resultTemplate) {
+      return applyTemplate(exec.resultTemplate, { ...params, responseText: bodyText.trim() });
+    }
+    return bodyText.trim();
+  }
+
   let data: unknown;
   try {
     data = JSON.parse(bodyText) as unknown;
   } catch {
-    throw new Error('Response is not valid JSON');
+    if (exec.resultTemplate) {
+      return applyTemplate(exec.resultTemplate, { ...params, responseText: bodyText.trim() });
+    }
+    return bodyText.trim();
   }
-  return exec.resultPath ? getNestedValue(data, exec.resultPath) : data;
+
+  const targetData = exec.resultPath ? getNestedValue(data, exec.resultPath) : data;
+
+  if (exec.resultTemplate) {
+    const mergedContext: Record<string, unknown> = {
+      ...params,
+      ...(typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : {}),
+      ...(typeof targetData === 'object' && targetData !== null ? (targetData as Record<string, unknown>) : {}),
+      data: targetData,
+    };
+    return applyTemplate(exec.resultTemplate, mergedContext);
+  }
+
+  return targetData;
 }
 
 // ── Skill → Tool ──────────────────────────────────
@@ -176,8 +220,9 @@ function skillEntry(skill: SkillDef): LoadedSkillEntry {
     tool: tool({
       description: skill.description,
       parameters: parameterSchema,
-      execute: async (params: Record<string, unknown>) => {
+      execute: async (rawParams: Record<string, unknown>) => {
         try {
+          const params = (parameterSchema.parse(rawParams ?? {})) as Record<string, unknown>;
           if (skill.execute.type === 'http') {
             return await executeHttp(skill.execute, params, skill.trusted);
           }

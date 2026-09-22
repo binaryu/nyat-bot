@@ -4,7 +4,8 @@ dist/
 .env
 *.db
 *.db-journal
-data/
+data/*
+!data/skills/
 logs/
 *.log
 coverage/
