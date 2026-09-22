@@ -100,6 +100,9 @@ const envSchema = z.object({
   // 全失败后才落到这条付费路由。未配 KEY → 默认关,不发任何 Firecrawl 调用。
   FIRECRAWL_API_KEY: z.string().optional(),
   FIRECRAWL_API_URL: z.string().url().default('https://api.firecrawl.dev'),
+  // Tavily 搜索直连（免除独立 Node 子进程与 MCP 内存开销）
+  TAVILY_API_KEY: z.string().optional(),
+  TAVILY_API_URL: z.string().url().default('https://api.tavily.com'),
   WEB_FETCH_USER_AGENT: z.string().default('XXB-WebFetch/1.0'),
   IP_QUALITY_API_URL: z.string().url().optional(),
   TIMER_API_URL: z.string().url().optional(),

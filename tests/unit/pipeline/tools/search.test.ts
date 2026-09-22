@@ -118,3 +118,79 @@ describe('executeSearch via MCP delegation', () => {
     expect(mockCallTool).not.toHaveBeenCalled();
   });
 });
+
+describe('executeSearch via Direct Tavily REST', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetTools.mockReturnValue({
+      tavily_search: {
+        serverName: 'tavily',
+        originalName: 'tavily_search',
+        name: 'tavily_search',
+      },
+    });
+  });
+
+  it('calls direct Tavily API when TAVILY_API_KEY is configured', async () => {
+    mockEnv.mockReturnValue({
+      TAVILY_API_KEY: 'tvly-test-key',
+      TAVILY_API_URL: 'https://api.tavily.com',
+      MCP_ENABLED: false,
+    });
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        query: 'test query',
+        answer: 'This is a summary',
+        results: [
+          { title: 'Result 1', url: 'https://example.com/1', content: 'Snippet 1' },
+          { title: 'Result 2', url: 'https://example.com/2', content: 'Snippet 2' },
+        ],
+      }),
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    try {
+      const result = await executeSearch('test query');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, req] = mockFetch.mock.calls[0];
+      expect(url).toBe('https://api.tavily.com/search');
+      const body = JSON.parse(req.body);
+      expect(body.api_key).toBe('tvly-test-key');
+      expect(body.query).toBe('test query');
+      expect(result).toContain('概述：This is a summary');
+      expect(result).toContain('[Result 1](https://example.com/1)');
+      expect(result).toContain('Snippet 1');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('falls back to MCP when direct Tavily search fails', async () => {
+    mockEnv.mockReturnValue({
+      TAVILY_API_KEY: 'tvly-test-key',
+      TAVILY_API_URL: 'https://api.tavily.com',
+      MCP_ENABLED: true,
+    });
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => 'Internal Server Error',
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    mockCallTool.mockResolvedValue('MCP fallback search result');
+
+    try {
+      const result = await executeSearch('test query');
+      expect(mockCallTool).toHaveBeenCalledWith('tavily', 'tavily_search', {
+        query: 'test query',
+      });
+      expect(result).toBe('MCP fallback search result');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
